@@ -12,7 +12,7 @@ use std::{
     ops::Range,
     sync::{
         Arc, LazyLock, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -86,7 +86,7 @@ use lance_select::RowAddrTreeMap;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{info, instrument};
 use uuid::Uuid;
@@ -455,6 +455,89 @@ struct PreparedPartitionSearch<S: IvfSubIndex, Q: Quantization> {
     raw_query_context: Option<Arc<RabitRawQueryContext>>,
     part_entry: Arc<PartitionEntry<S, Q>>,
     _marker: PhantomData<(S, Q)>,
+}
+
+struct PreparedPartitionRetentionTracker {
+    metrics: Arc<dyn MetricsCollector>,
+    live_count: AtomicUsize,
+    live_bytes: AtomicUsize,
+    peak_count: AtomicUsize,
+    peak_bytes: AtomicUsize,
+}
+
+impl PreparedPartitionRetentionTracker {
+    fn new(metrics: Arc<dyn MetricsCollector>) -> Self {
+        metrics.record_prepared_partition_live(0, 0);
+        Self {
+            metrics,
+            live_count: AtomicUsize::new(0),
+            live_bytes: AtomicUsize::new(0),
+            peak_count: AtomicUsize::new(0),
+            peak_bytes: AtomicUsize::new(0),
+        }
+    }
+
+    fn track<S: IvfSubIndex, Q: Quantization>(
+        self: &Arc<Self>,
+        prepared: PreparedPartitionSearch<S, Q>,
+        permit: OwnedSemaphorePermit,
+    ) -> TrackedPreparedPartitionSearch<S, Q> {
+        let bytes = prepared_partition_search_bytes(&prepared);
+        let live_count = self.live_count.fetch_add(1, Ordering::SeqCst) + 1;
+        let live_bytes = self.live_bytes.fetch_add(bytes, Ordering::SeqCst) + bytes;
+        self.peak_count.fetch_max(live_count, Ordering::SeqCst);
+        self.peak_bytes.fetch_max(live_bytes, Ordering::SeqCst);
+        self.metrics
+            .record_prepared_partition_live(live_count, live_bytes);
+        self.metrics
+            .record_prepared_partition_peak(live_count, live_bytes);
+        info!(
+            target: TRACE_IO_EVENTS,
+            r#type = "ivf_prepared_partition_retention",
+            prepared_count = live_count,
+            prepared_bytes = live_bytes
+        );
+        TrackedPreparedPartitionSearch {
+            prepared: Some(prepared),
+            _permit: permit,
+            tracker: self.clone(),
+            bytes,
+        }
+    }
+
+    fn release(&self, bytes: usize) {
+        let live_count = self.live_count.fetch_sub(1, Ordering::SeqCst) - 1;
+        let live_bytes = self.live_bytes.fetch_sub(bytes, Ordering::SeqCst) - bytes;
+        self.metrics
+            .record_prepared_partition_live(live_count, live_bytes);
+    }
+}
+
+struct TrackedPreparedPartitionSearch<S: IvfSubIndex, Q: Quantization> {
+    prepared: Option<PreparedPartitionSearch<S, Q>>,
+    _permit: OwnedSemaphorePermit,
+    tracker: Arc<PreparedPartitionRetentionTracker>,
+    bytes: usize,
+}
+
+impl<S: IvfSubIndex, Q: Quantization> TrackedPreparedPartitionSearch<S, Q> {
+    fn take_prepared(&mut self) -> PreparedPartitionSearch<S, Q> {
+        self.prepared
+            .take()
+            .expect("prepared partition search should only be consumed once")
+    }
+}
+
+impl<S: IvfSubIndex, Q: Quantization> Drop for TrackedPreparedPartitionSearch<S, Q> {
+    fn drop(&mut self) {
+        self.tracker.release(self.bytes);
+    }
+}
+
+fn prepared_partition_search_bytes<S: IvfSubIndex, Q: Quantization>(
+    prepared: &PreparedPartitionSearch<S, Q>,
+) -> usize {
+    prepared.part_entry.deep_size_of()
 }
 
 #[derive(Debug)]
@@ -1152,6 +1235,23 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     fn run_prepared_partition_search(
         use_query_residual: bool,
         use_residual_scratch: bool,
+        mut prepared: TrackedPreparedPartitionSearch<S, Q>,
+        metrics: &dyn MetricsCollector,
+        scratch: &mut QueryScratch,
+    ) -> Result<RecordBatch> {
+        let prepared = prepared.take_prepared();
+        Self::run_prepared_partition_search_inner(
+            use_query_residual,
+            use_residual_scratch,
+            prepared,
+            metrics,
+            scratch,
+        )
+    }
+
+    fn run_prepared_partition_search_inner(
+        use_query_residual: bool,
+        use_residual_scratch: bool,
         prepared: PreparedPartitionSearch<S, Q>,
         metrics: &dyn MetricsCollector,
         scratch: &mut QueryScratch,
@@ -1201,6 +1301,26 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
 
     #[allow(clippy::too_many_arguments)]
     fn accumulate_prepared_partition_search(
+        use_query_residual: bool,
+        use_residual_scratch: bool,
+        mut prepared: TrackedPreparedPartitionSearch<S, Q>,
+        heap: &mut BinaryHeap<OrderedNode<u64>>,
+        scratch: &mut QueryScratch,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<()> {
+        let prepared = prepared.take_prepared();
+        Self::accumulate_prepared_partition_search_inner(
+            use_query_residual,
+            use_residual_scratch,
+            prepared,
+            heap,
+            scratch,
+            metrics,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_prepared_partition_search_inner(
         use_query_residual: bool,
         use_residual_scratch: bool,
         prepared: PreparedPartitionSearch<S, Q>,
@@ -2095,7 +2215,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             .downcast::<PreparedPartitionSearch<S, Q>>()
             .map_err(|_| Error::internal("failed to downcast prepared partition search"))?;
         self.scratch_pool.with_scratch(|scratch| {
-            Self::run_prepared_partition_search(
+            Self::run_prepared_partition_search_inner(
                 self.use_query_residual,
                 self.use_residual_scratch,
                 *prepared,
@@ -2152,54 +2272,114 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             let prepare_index = self.clone();
             let prepare_metrics = metrics.clone();
             let prepare_raw_query_context = raw_query_context.clone();
-            let prepared = stream::iter(start_idx..end_idx)
-                .map(move |idx| {
-                    let part_id = partitions.value(idx);
-                    let mut query = query.clone();
-                    query.dist_q_c = q_c_dists.value(idx);
-                    let index = prepare_index.clone();
-                    let pre_filter = pre_filter.clone();
-                    let metrics = prepare_metrics.clone();
-                    let raw_query_context = prepare_raw_query_context.clone();
-                    async move {
-                        index
-                            .prepare_partition_without_prefilter_wait(
-                                part_id as usize,
-                                &query,
-                                pre_filter,
-                                metrics.as_ref(),
-                                raw_query_context,
-                            )
-                            .await
-                    }
-                })
-                .buffered(prepare_parallelism)
-                .try_collect::<Vec<_>>()
-                .await?;
+            let retention_tracker =
+                Arc::new(PreparedPartitionRetentionTracker::new(metrics.clone()));
+            let retention_permits = Arc::new(Semaphore::new(*STREAMING_SEARCH_BATCH_SIZE));
+            let (prepared_tx, mut prepared_rx) = mpsc::channel::<
+                Result<TrackedPreparedPartitionSearch<S, Q>>,
+            >(*STREAMING_SEARCH_BATCH_SIZE);
+            tokio::spawn(async move {
+                let prepare_stream = stream::iter(start_idx..end_idx)
+                    .map(move |idx| {
+                        let part_id = partitions.value(idx);
+                        let mut query = query.clone();
+                        query.dist_q_c = q_c_dists.value(idx);
+                        let index = prepare_index.clone();
+                        let pre_filter = pre_filter.clone();
+                        let metrics = prepare_metrics.clone();
+                        let raw_query_context = prepare_raw_query_context.clone();
+                        let retention_tracker = retention_tracker.clone();
+                        let retention_permits = retention_permits.clone();
+                        async move {
+                            let permit = retention_permits.acquire_owned().await.map_err(|_| {
+                                Error::internal(
+                                    "prepared partition retention limiter was closed".to_string(),
+                                )
+                            })?;
+                            let prepared = index
+                                .prepare_partition_without_prefilter_wait(
+                                    part_id as usize,
+                                    &query,
+                                    pre_filter,
+                                    metrics.as_ref(),
+                                    raw_query_context,
+                                )
+                                .await?;
+                            Ok(retention_tracker.track(prepared, permit))
+                        }
+                    })
+                    .buffered(prepare_parallelism);
 
-            let use_query_residual = self.use_query_residual;
-            let use_residual_scratch = self.use_residual_scratch;
-            let search_metrics = metrics.clone();
-            let scratch_pool = self.scratch_pool.clone();
-            let batch = spawn_cpu(move || -> DataFusionResult<RecordBatch> {
-                let mut heap = BinaryHeap::with_capacity(heap_capacity);
-                scratch_pool.with_scratch(|scratch| -> DataFusionResult<()> {
-                    for prepared in prepared {
-                        Self::accumulate_prepared_partition_search(
-                            use_query_residual,
-                            use_residual_scratch,
-                            prepared,
-                            &mut heap,
-                            scratch,
-                            search_metrics.as_ref(),
-                        )
-                        .map_err(DataFusionError::from)?;
+                futures::pin_mut!(prepare_stream);
+                while let Some(prepared) = prepare_stream.next().await {
+                    let has_error = prepared.is_err();
+                    if prepared_tx.send(prepared).await.is_err() || has_error {
+                        break;
                     }
-                    Ok(())
-                })?;
-                Self::global_heap_to_batch(heap).map_err(DataFusionError::from)
-            })
-            .await?;
+                }
+            });
+
+            let mut heap = BinaryHeap::with_capacity(heap_capacity);
+            loop {
+                let mut prepared_batch = Vec::with_capacity(*STREAMING_SEARCH_BATCH_SIZE);
+                let mut prepare_error = None;
+                let mut producer_done = false;
+                match prepared_rx.recv().await {
+                    Some(Ok(prepared)) => prepared_batch.push(prepared),
+                    Some(Err(err)) => prepare_error = Some(DataFusionError::from(err)),
+                    None => producer_done = true,
+                }
+                while prepare_error.is_none()
+                    && !producer_done
+                    && prepared_batch.len() < *STREAMING_SEARCH_BATCH_SIZE
+                {
+                    match prepared_rx.try_recv() {
+                        Ok(Ok(prepared)) => prepared_batch.push(prepared),
+                        Ok(Err(err)) => {
+                            prepare_error = Some(DataFusionError::from(err));
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            producer_done = true;
+                        }
+                    }
+                }
+
+                if !prepared_batch.is_empty() {
+                    let use_query_residual = self.use_query_residual;
+                    let use_residual_scratch = self.use_residual_scratch;
+                    let search_metrics = metrics.clone();
+                    let scratch_pool = self.scratch_pool.clone();
+                    heap = spawn_cpu(move || -> DataFusionResult<BinaryHeap<OrderedNode<u64>>> {
+                        let mut heap = heap;
+                        scratch_pool.with_scratch(|scratch| -> DataFusionResult<()> {
+                            for prepared in prepared_batch {
+                                Self::accumulate_prepared_partition_search(
+                                    use_query_residual,
+                                    use_residual_scratch,
+                                    prepared,
+                                    &mut heap,
+                                    scratch,
+                                    search_metrics.as_ref(),
+                                )
+                                .map_err(DataFusionError::from)?;
+                            }
+                            Ok(())
+                        })?;
+                        Ok(heap)
+                    })
+                    .await?;
+                }
+
+                if let Some(err) = prepare_error {
+                    return Err(err.into());
+                }
+                if producer_done {
+                    break;
+                }
+            }
+
+            let batch = Self::global_heap_to_batch(heap)?;
 
             return Ok(Box::pin(RecordBatchStreamAdapter::new(
                 VECTOR_RESULT_SCHEMA.clone(),
@@ -2210,13 +2390,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         // The prepared channel holds a full search batch so that partitions prepared
         // while the previous batch is being searched are ready for the next greedy
         // drain, instead of serializing producer and consumer through a single slot.
-        let (prepared_tx, mut prepared_rx) =
-            mpsc::channel::<Result<PreparedPartitionSearch<S, Q>>>(*STREAMING_SEARCH_BATCH_SIZE);
+        let (prepared_tx, mut prepared_rx) = mpsc::channel::<
+            Result<TrackedPreparedPartitionSearch<S, Q>>,
+        >(*STREAMING_SEARCH_BATCH_SIZE);
         let (batch_tx, batch_rx) = mpsc::channel::<DataFusionResult<RecordBatch>>(1);
 
         let prepare_index = self.clone();
         let prepare_metrics = metrics.clone();
         let prepare_raw_query_context = raw_query_context.clone();
+        let retention_tracker = Arc::new(PreparedPartitionRetentionTracker::new(metrics.clone()));
+        let retention_permits = Arc::new(Semaphore::new(*STREAMING_SEARCH_BATCH_SIZE));
         tokio::spawn(async move {
             let prepare_stream = stream::iter(start_idx..end_idx)
                 .map(move |idx| {
@@ -2227,8 +2410,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     let pre_filter = pre_filter.clone();
                     let metrics = prepare_metrics.clone();
                     let raw_query_context = prepare_raw_query_context.clone();
+                    let retention_tracker = retention_tracker.clone();
+                    let retention_permits = retention_permits.clone();
                     async move {
-                        index
+                        let permit = retention_permits.acquire_owned().await.map_err(|_| {
+                            Error::internal(
+                                "prepared partition retention limiter was closed".to_string(),
+                            )
+                        })?;
+                        let prepared = index
                             .prepare_partition(
                                 part_id as usize,
                                 &query,
@@ -2236,7 +2426,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                                 metrics.as_ref(),
                                 raw_query_context,
                             )
-                            .await
+                            .await?;
+                        Ok(retention_tracker.track(prepared, permit))
                     }
                 })
                 .buffered(prepare_parallelism);
@@ -2308,7 +2499,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
 
                 if !prepared_batch.is_empty() {
                     let scratch_pool = scratch_pool.clone();
-                    let search_metrics = search_metrics.clone();
+                    let search_metrics_for_search = search_metrics.clone();
                     let search_control = search_control.clone();
                     // `is_closed` is synchronously callable, so a sender clone lets the
                     // CPU loop notice a dropped receiver between partitions instead of
@@ -2336,7 +2527,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                                     use_query_residual,
                                     use_residual_scratch,
                                     prepared,
-                                    search_metrics.as_ref(),
+                                    search_metrics_for_search.as_ref(),
                                     scratch,
                                 )
                                 .map_err(DataFusionError::from)
@@ -2549,7 +2740,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                                 part_entry: part_entry.clone(),
                                 _marker: PhantomData,
                             };
-                            Self::accumulate_prepared_partition_search(
+                            Self::accumulate_prepared_partition_search_inner(
                                 use_query_residual,
                                 use_residual_scratch,
                                 prepared,
@@ -2739,6 +2930,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::iter::repeat_n;
+    use std::marker::PhantomData;
     use std::{
         ops::Range,
         sync::{
@@ -2756,6 +2948,7 @@ mod tests {
     };
     use arrow_buffer::OffsetBuffer;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
+    use futures::{StreamExt, stream};
     use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::vector::bq::{
@@ -2792,9 +2985,8 @@ mod tests {
     use lance_file::reader::{FileReader, FileReaderOptions};
     use lance_index::IndexType;
     use lance_index::optimize::OptimizeOptions;
-    use lance_index::prefilter::PreFilter;
+    use lance_index::prefilter::{NoFilter, PreFilter};
     use lance_index::progress::IndexBuildProgress;
-    use lance_index::vector::DIST_COL;
     use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
     use lance_index::vector::flat::storage::FlatFloatStorage;
     use lance_index::vector::hnsw::HNSW;
@@ -2805,6 +2997,7 @@ mod tests {
     use lance_index::vector::quantizer::QuantizerMetadata;
     use lance_index::vector::sq::ScalarQuantizer;
     use lance_index::vector::sq::builder::SQBuildParams;
+    use lance_index::vector::{ApproxMode, DIST_COL, Query};
     use lance_index::vector::{
         pq::storage::ProductQuantizationMetadata,
         sq::storage::{SQ_METADATA_KEY, ScalarQuantizationMetadata},
@@ -2824,6 +3017,7 @@ mod tests {
     use rand::distr::{Distribution, StandardUniform, uniform::SampleUniform};
     use rand::{Rng, SeedableRng, rngs::StdRng};
     use rstest::rstest;
+    use tokio::sync::{Notify, Semaphore, mpsc};
     use uuid::Uuid;
 
     const NUM_ROWS: usize = 512;
@@ -2839,6 +3033,102 @@ mod tests {
     const LIGHTWEIGHT_PQ_SUB_VECTORS: usize = 4;
 
     lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
+
+    fn dummy_prepared_partition_search(
+        partition_id: usize,
+    ) -> super::PreparedPartitionSearch<FlatIndex, FlatQuantizer> {
+        let vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0_f32]), 1).unwrap();
+        let storage = FlatFloatStorage::new(vectors, DistanceType::L2);
+        let part_entry = super::PartitionEntry::new(FlatIndex::default(), storage);
+        super::PreparedPartitionSearch {
+            query: Query {
+                column: "vector".to_string(),
+                key: Arc::new(Float32Array::from(vec![0.0])) as ArrayRef,
+                k: 1,
+                lower_bound: None,
+                upper_bound: None,
+                minimum_nprobes: 1,
+                maximum_nprobes: None,
+                ef: None,
+                refine_factor: None,
+                metric_type: Some(DistanceType::L2),
+                use_index: true,
+                query_parallelism: 0,
+                dist_q_c: 0.0,
+                approx_mode: ApproxMode::default(),
+            },
+            pre_filter: Arc::new(NoFilter),
+            partition_id,
+            partition_centroid: None,
+            rq_search_cache: None,
+            raw_query_context: None,
+            part_entry: Arc::new(part_entry),
+            _marker: PhantomData,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ordered_prepare_buffer_obeys_total_retention_budget() {
+        const BUDGET: usize = 4;
+        const NPROBES: usize = 16;
+
+        let tracker = Arc::new(super::PreparedPartitionRetentionTracker::new(Arc::new(
+            NoOpMetricsCollector,
+        )));
+        let permits = Arc::new(Semaphore::new(BUDGET));
+        let release_first = Arc::new(Notify::new());
+        let (tx, mut rx) = mpsc::channel::<
+            super::TrackedPreparedPartitionSearch<FlatIndex, FlatQuantizer>,
+        >(BUDGET);
+
+        let producer_tracker = tracker.clone();
+        let producer_permits = permits.clone();
+        let producer_release = release_first.clone();
+        let producer = tokio::spawn(async move {
+            let prepared = stream::iter(0..NPROBES)
+                .map(move |idx| {
+                    let tracker = producer_tracker.clone();
+                    let permits = producer_permits.clone();
+                    let release_first = producer_release.clone();
+                    async move {
+                        let permit = permits.acquire_owned().await.unwrap();
+                        if idx == 0 {
+                            release_first.notified().await;
+                        }
+                        tracker.track(dummy_prepared_partition_search(idx), permit)
+                    }
+                })
+                .buffered(NPROBES);
+            futures::pin_mut!(prepared);
+            while let Some(item) = prepared.next().await {
+                if tx.send(item).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        while tracker.live_count.load(Ordering::SeqCst) < BUDGET - 1 {
+            tokio::task::yield_now().await;
+        }
+        release_first.notify_one();
+        while rx.len() < BUDGET {
+            tokio::task::yield_now().await;
+        }
+
+        let mut consumer_batch = Vec::with_capacity(BUDGET);
+        while consumer_batch.len() < BUDGET {
+            consumer_batch.push(rx.recv().await.unwrap());
+        }
+
+        assert_eq!(
+            tracker.peak_count.load(Ordering::SeqCst),
+            BUDGET,
+            "ordered buffered preparation must not retain beyond the total budget",
+        );
+        drop(consumer_batch);
+        producer.abort();
+    }
 
     #[test]
     fn test_prewarm_parallelism_is_bounded_by_io_and_cpu() {

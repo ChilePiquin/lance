@@ -4978,6 +4978,59 @@ mod tests {
         assert_eq!(node_metric(&warm, "ANNIvfPartition", "bytes_read"), "0");
     }
 
+    #[tokio::test]
+    async fn test_prepared_partition_retention_metrics_are_bounded() {
+        fn node_metric<'a>(plan: &'a str, node: &str, metric: &str) -> &'a str {
+            let line = plan
+                .lines()
+                .find(|l| l.trim_start().starts_with(node))
+                .unwrap_or_else(|| panic!("plan missing node {node}:\n{plan}"));
+            let after = line
+                .split_once(&format!("{metric}="))
+                .unwrap_or_else(|| panic!("node {node} line missing {metric}=:\n{line}"))
+                .1;
+            after.split([',', ']']).next().unwrap().trim()
+        }
+
+        let batch_size = *STREAMING_SEARCH_BATCH_SIZE;
+        if batch_size >= 100 {
+            // The fixture below is intentionally small. If the batch size is
+            // overridden above the fixture size then there is no multi-batch
+            // retention boundary to assert.
+            return;
+        }
+        let nprobes = batch_size + 3;
+        let fixture = NprobesTestFixture::new(nprobes, 1).await;
+        let q = fixture.get_centroid(0);
+
+        let plan = fixture
+            .dataset
+            .scan()
+            .nearest("vector", q.as_ref(), 10)
+            .unwrap()
+            .minimum_nprobes(nprobes)
+            .analyze_plan()
+            .await
+            .unwrap();
+
+        let peak_count = node_metric(&plan, "ANNSubIndex", "ivf_prepared_partition_peak_count")
+            .parse::<usize>()
+            .unwrap();
+        assert!(
+            peak_count <= batch_size,
+            "expected peak prepared partitions <= batch size {batch_size}, got {peak_count}:\n{plan}",
+        );
+        assert!(
+            peak_count < nprobes,
+            "prepared partitions should not be retained for all {nprobes} probes:\n{plan}",
+        );
+        assert_ne!(
+            node_metric(&plan, "ANNSubIndex", "ivf_prepared_partition_peak_bytes"),
+            "0",
+            "prepared partition byte metric should make local retention measurable:\n{plan}",
+        );
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_no_prefilter_results(#[values(1, 20)] num_deltas: usize) {
