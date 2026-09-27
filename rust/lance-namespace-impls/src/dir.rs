@@ -273,6 +273,7 @@ pub struct DirectoryNamespaceBuilder {
     storage_options: Option<HashMap<String, String>>,
     session: Option<Arc<Session>>,
     manifest_enabled: bool,
+    manifest_cache_mode: manifest::ManifestCacheMode,
     dir_listing_enabled: bool,
     inline_optimization_enabled: bool,
     table_version_tracking_enabled: bool,
@@ -302,6 +303,7 @@ impl std::fmt::Debug for DirectoryNamespaceBuilder {
             .field("root", &self.root)
             .field("storage_options", &self.storage_options)
             .field("manifest_enabled", &self.manifest_enabled)
+            .field("manifest_cache_mode", &self.manifest_cache_mode)
             .field("dir_listing_enabled", &self.dir_listing_enabled)
             .field(
                 "inline_optimization_enabled",
@@ -344,6 +346,7 @@ impl DirectoryNamespaceBuilder {
             storage_options: None,
             session: None,
             manifest_enabled: true,
+            manifest_cache_mode: manifest::ManifestCacheMode::None,
             dir_listing_enabled: true, // Default to enabled for backwards compatibility
             inline_optimization_enabled: false,
             table_version_tracking_enabled: false, // Default to disabled
@@ -363,6 +366,15 @@ impl DirectoryNamespaceBuilder {
     /// When disabled, relies solely on directory scanning.
     pub fn manifest_enabled(mut self, enabled: bool) -> Self {
         self.manifest_enabled = enabled;
+        self
+    }
+
+    /// Configure manifest read caching.
+    ///
+    /// Defaults to `none`. `in_memory` pins a snapshot of the manifest table
+    /// for the lifetime of this namespace instance.
+    pub fn manifest_cache_mode(mut self, mode: manifest::ManifestCacheMode) -> Self {
+        self.manifest_cache_mode = mode;
         self
     }
 
@@ -413,6 +425,7 @@ impl DirectoryNamespaceBuilder {
     /// It expects:
     /// - `root`: The root directory path (required)
     /// - `manifest_enabled`: Enable manifest-based table tracking (optional, default: true)
+    /// - `manifest_cache_mode`: Manifest read cache mode: `none` or `in_memory` (optional, default: none)
     /// - `dir_listing_enabled`: Enable directory listing for table discovery (optional, default: true)
     /// - `inline_optimization_enabled`: Enable replacement indices on __manifest rewrites (optional, default: false)
     /// - `storage.*`: Storage options (optional, prefix will be stripped)
@@ -506,6 +519,12 @@ impl DirectoryNamespaceBuilder {
             .and_then(|v| str_to_bool(v))
             .unwrap_or(true);
 
+        let manifest_cache_mode = properties
+            .get("manifest_cache_mode")
+            .map(|v| manifest::ManifestCacheMode::parse(v))
+            .transpose()?
+            .unwrap_or_default();
+
         // Extract dir_listing_enabled (default: true)
         let dir_listing_enabled = properties
             .get("dir_listing_enabled")
@@ -567,6 +586,7 @@ impl DirectoryNamespaceBuilder {
             storage_options,
             session,
             manifest_enabled,
+            manifest_cache_mode,
             dir_listing_enabled,
             inline_optimization_enabled,
             table_version_tracking_enabled,
@@ -759,6 +779,7 @@ impl DirectoryNamespaceBuilder {
                 self.dir_listing_enabled,
                 self.inline_optimization_enabled,
                 self.commit_retries,
+                self.manifest_cache_mode,
             )
             .await
             {
@@ -808,6 +829,7 @@ impl DirectoryNamespaceBuilder {
             manifest_ns: manifest_cell,
             write_manifest_ns: OnceCell::new(),
             manifest_enabled: self.manifest_enabled,
+            manifest_cache_mode: self.manifest_cache_mode,
             dir_listing_enabled: self.dir_listing_enabled,
             inline_optimization_enabled: self.inline_optimization_enabled,
             commit_retries: self.commit_retries,
@@ -890,6 +912,7 @@ pub struct DirectoryNamespace {
     manifest_ns: OnceCell<Arc<manifest::ManifestNamespace>>,
     write_manifest_ns: OnceCell<Arc<manifest::ManifestNamespace>>,
     manifest_enabled: bool,
+    manifest_cache_mode: manifest::ManifestCacheMode,
     dir_listing_enabled: bool,
     inline_optimization_enabled: bool,
     commit_retries: Option<u32>,
@@ -1020,10 +1043,32 @@ impl DirectoryNamespace {
             .or_else(|| self.manifest_ns.get())
     }
 
+    fn is_in_memory_manifest_cache(&self) -> bool {
+        self.manifest_enabled
+            && matches!(
+                self.manifest_cache_mode,
+                manifest::ManifestCacheMode::InMemory
+            )
+    }
+
+    fn ensure_not_in_memory_cache_for_write(&self, operation: &str) -> Result<()> {
+        if self.is_in_memory_manifest_cache() {
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "{} is not supported when manifest_cache_mode is in_memory",
+                    operation
+                ),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     async fn manifest_ns_for_write(&self) -> Result<Option<Arc<manifest::ManifestNamespace>>> {
         if !self.manifest_enabled {
             return Ok(None);
         }
+        self.ensure_not_in_memory_cache_for_write("write manifest")?;
 
         let manifest_ns = self
             .write_manifest_ns
@@ -1037,6 +1082,7 @@ impl DirectoryNamespace {
                     self.dir_listing_enabled,
                     self.inline_optimization_enabled,
                     self.commit_retries,
+                    self.manifest_cache_mode,
                 )
                 .await
                 .map(Arc::new)
@@ -1075,6 +1121,7 @@ impl DirectoryNamespace {
                     self.dir_listing_enabled,
                     self.inline_optimization_enabled,
                     self.commit_retries,
+                    self.manifest_cache_mode,
                 )
                 .await
                 .map(Arc::new)
@@ -4017,6 +4064,7 @@ impl LanceNamespace for DirectoryNamespace {
         request: CreateTableVersionRequest,
     ) -> Result<CreateTableVersionResponse> {
         self.record_op("create_table_version");
+        self.ensure_not_in_memory_cache_for_write("create_table_version")?;
         let branch = Self::normalized_branch(request.branch.as_deref())?;
         let table_uri = self.resolve_table_location(&request.id).await?;
         let (table_uri, table_path, branch_parent_version) = match branch {
@@ -4211,6 +4259,7 @@ impl LanceNamespace for DirectoryNamespace {
         request: BatchDeleteTableVersionsRequest,
     ) -> Result<BatchDeleteTableVersionsResponse> {
         self.record_op("batch_delete_table_versions");
+        self.ensure_not_in_memory_cache_for_write("batch_delete_table_versions")?;
         let branch = Self::normalized_branch(request.branch.as_deref())?;
         // Single-table mode: use `id` (from path parameter) + `ranges` to delete
         // versions from one table.
@@ -4265,6 +4314,7 @@ impl LanceNamespace for DirectoryNamespace {
         request: CreateTableIndexRequest,
     ) -> Result<CreateTableIndexResponse> {
         self.record_op("create_table_index");
+        self.ensure_not_in_memory_cache_for_write("create_table_index")?;
         let table_uri = self.resolve_table_location(&request.id).await?;
         let mut dataset = self
             .load_dataset(&table_uri, None, "create_table_index")
@@ -4525,6 +4575,7 @@ impl LanceNamespace for DirectoryNamespace {
         request: AlterTransactionRequest,
     ) -> Result<AlterTransactionResponse> {
         self.record_op("alter_transaction");
+        self.ensure_not_in_memory_cache_for_write("alter_transaction")?;
 
         // Parse the request ID: must include table id and transaction identifier
         let mut request_id = request.id.ok_or_else(|| {
@@ -4748,6 +4799,7 @@ impl LanceNamespace for DirectoryNamespace {
         request: DropTableIndexRequest,
     ) -> Result<DropTableIndexResponse> {
         self.record_op("drop_table_index");
+        self.ensure_not_in_memory_cache_for_write("drop_table_index")?;
         let table_uri = self.resolve_table_location(&request.id).await?;
         let index_name = request.index_name.as_deref().ok_or_else(|| {
             lance_core::Error::from(NamespaceError::InvalidInput {
@@ -4818,6 +4870,7 @@ impl LanceNamespace for DirectoryNamespace {
     }
 
     async fn restore_table(&self, request: RestoreTableRequest) -> Result<RestoreTableResponse> {
+        self.ensure_not_in_memory_cache_for_write("restore_table")?;
         let version = request.version;
         if version < 0 {
             return Err(Error::invalid_input_source(
@@ -4883,6 +4936,7 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: UpdateTableSchemaMetadataRequest,
     ) -> Result<UpdateTableSchemaMetadataResponse> {
+        self.ensure_not_in_memory_cache_for_write("update_table_schema_metadata")?;
         let table_uri = self.resolve_table_location(&request.id).await?;
         let mut dataset = self
             .load_dataset(&table_uri, None, "update_table_schema_metadata")
@@ -5116,6 +5170,7 @@ impl LanceNamespace for DirectoryNamespace {
         request_data: Bytes,
     ) -> Result<InsertIntoTableResponse> {
         self.record_op("insert_into_table");
+        self.ensure_not_in_memory_cache_for_write("insert_into_table")?;
         let table_uri = self.resolve_table_location(&request.id).await?;
         let (reader, _num_rows) =
             Self::ipc_reader_from_request_data(&request_data, "insert_into_table")?;
@@ -5155,6 +5210,7 @@ impl LanceNamespace for DirectoryNamespace {
         request_data: Bytes,
     ) -> Result<MergeInsertIntoTableResponse> {
         self.record_op("merge_insert_into_table");
+        self.ensure_not_in_memory_cache_for_write("merge_insert_into_table")?;
         let table_uri = self.resolve_table_location(&request.id).await?;
         let on = merge_insert_on_columns(request.on.as_deref(), "merge_insert_into_table")?;
 
@@ -5250,6 +5306,7 @@ impl LanceNamespace for DirectoryNamespace {
 
     async fn update_table(&self, request: UpdateTableRequest) -> Result<UpdateTableResponse> {
         self.record_op("update_table");
+        self.ensure_not_in_memory_cache_for_write("update_table")?;
 
         if request.updates.is_empty() {
             return Err(NamespaceError::InvalidInput {
@@ -5338,6 +5395,7 @@ impl LanceNamespace for DirectoryNamespace {
         request: DeleteFromTableRequest,
     ) -> Result<DeleteFromTableResponse> {
         self.record_op("delete_from_table");
+        self.ensure_not_in_memory_cache_for_write("delete_from_table")?;
 
         if request.predicate.trim().is_empty() {
             return Err(NamespaceError::InvalidInput {
@@ -5672,6 +5730,7 @@ impl LanceNamespace for DirectoryNamespace {
         request: CreateTableTagRequest,
     ) -> Result<CreateTableTagResponse> {
         self.record_op("create_table_tag");
+        self.ensure_not_in_memory_cache_for_write("create_table_tag")?;
         if request.tag.is_empty() {
             return Err(NamespaceError::InvalidInput {
                 message: "tag name must not be empty for create_table_tag".to_string(),
@@ -5710,6 +5769,7 @@ impl LanceNamespace for DirectoryNamespace {
         request: DeleteTableTagRequest,
     ) -> Result<DeleteTableTagResponse> {
         self.record_op("delete_table_tag");
+        self.ensure_not_in_memory_cache_for_write("delete_table_tag")?;
         if request.tag.is_empty() {
             return Err(NamespaceError::InvalidInput {
                 message: "tag name must not be empty for delete_table_tag".to_string(),
@@ -5739,6 +5799,7 @@ impl LanceNamespace for DirectoryNamespace {
         request: UpdateTableTagRequest,
     ) -> Result<UpdateTableTagResponse> {
         self.record_op("update_table_tag");
+        self.ensure_not_in_memory_cache_for_write("update_table_tag")?;
         if request.tag.is_empty() {
             return Err(NamespaceError::InvalidInput {
                 message: "tag name must not be empty for update_table_tag".to_string(),
@@ -5777,6 +5838,7 @@ impl LanceNamespace for DirectoryNamespace {
         request: CreateTableBranchRequest,
     ) -> Result<CreateTableBranchResponse> {
         self.record_op("create_table_branch");
+        self.ensure_not_in_memory_cache_for_write("create_table_branch")?;
         if request.name.is_empty() {
             return Err(NamespaceError::InvalidInput {
                 message: "branch name must not be empty for create_table_branch".to_string(),
@@ -5893,6 +5955,7 @@ impl LanceNamespace for DirectoryNamespace {
         request: DeleteTableBranchRequest,
     ) -> Result<DeleteTableBranchResponse> {
         self.record_op("delete_table_branch");
+        self.ensure_not_in_memory_cache_for_write("delete_table_branch")?;
         if request.name.is_empty() {
             return Err(NamespaceError::InvalidInput {
                 message: "branch name must not be empty for delete_table_branch".to_string(),
@@ -9783,7 +9846,38 @@ mod tests {
         let builder = DirectoryNamespaceBuilder::from_properties(properties, None).unwrap();
         assert!(builder.manifest_enabled);
         assert!(builder.dir_listing_enabled);
+        assert_eq!(
+            builder.manifest_cache_mode,
+            manifest::ManifestCacheMode::None
+        );
         assert!(!builder.inline_optimization_enabled);
+    }
+
+    #[tokio::test]
+    async fn test_from_properties_manifest_cache_mode() {
+        let temp_dir = TempStdDir::default();
+
+        let mut properties = HashMap::new();
+        properties.insert("root".to_string(), temp_dir.to_str().unwrap().to_string());
+        properties.insert("manifest_cache_mode".to_string(), "in_memory".to_string());
+
+        let builder = DirectoryNamespaceBuilder::from_properties(properties, None).unwrap();
+        assert_eq!(
+            builder.manifest_cache_mode,
+            manifest::ManifestCacheMode::InMemory
+        );
+    }
+
+    #[tokio::test]
+    async fn test_from_properties_rejects_invalid_manifest_cache_mode() {
+        let temp_dir = TempStdDir::default();
+
+        let mut properties = HashMap::new();
+        properties.insert("root".to_string(), temp_dir.to_str().unwrap().to_string());
+        properties.insert("manifest_cache_mode".to_string(), "pinned".to_string());
+
+        let err = DirectoryNamespaceBuilder::from_properties(properties, None).unwrap_err();
+        assert!(err.to_string().contains("manifest_cache_mode"));
     }
 
     #[test]
@@ -10105,6 +10199,269 @@ mod tests {
         };
         let tables = reader.list_tables(list_req).await.unwrap().tables;
         assert_eq!(tables, vec!["table1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_manifest_cache_pins_namespace_snapshot() {
+        let temp_dir = TempStdDir::default();
+        let root = temp_dir.to_str().unwrap();
+
+        let writer = DirectoryNamespaceBuilder::new(root)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+        let ipc_data = create_test_ipc_data(&create_test_schema());
+        let mut create_table_req = CreateTableRequest::new();
+        create_table_req.id = Some(vec!["table1".to_string()]);
+        writer
+            .create_table(create_table_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        let reader = DirectoryNamespaceBuilder::new(root)
+            .dir_listing_enabled(false)
+            .manifest_cache_mode(manifest::ManifestCacheMode::InMemory)
+            .build()
+            .await
+            .unwrap();
+        let list_req = ListTablesRequest {
+            id: Some(vec![]),
+            ..Default::default()
+        };
+        assert_eq!(
+            reader.list_tables(list_req.clone()).await.unwrap().tables,
+            vec!["table1".to_string()]
+        );
+
+        let ipc_data = create_test_ipc_data(&create_test_schema());
+        let mut create_table_req = CreateTableRequest::new();
+        create_table_req.id = Some(vec!["table2".to_string()]);
+        writer
+            .create_table(create_table_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reader.list_tables(list_req.clone()).await.unwrap().tables,
+            vec!["table1".to_string()]
+        );
+
+        let new_reader = DirectoryNamespaceBuilder::new(root)
+            .dir_listing_enabled(false)
+            .manifest_cache_mode(manifest::ManifestCacheMode::InMemory)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            new_reader.list_tables(list_req).await.unwrap().tables,
+            vec!["table1".to_string(), "table2".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_manifest_cache_rejects_writes() {
+        let temp_dir = TempStdDir::default();
+        let root = temp_dir.to_str().unwrap();
+
+        let writer = DirectoryNamespaceBuilder::new(root)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+        let mut parent = CreateNamespaceRequest::new();
+        parent.id = Some(vec!["parent".to_string()]);
+        writer.create_namespace(parent).await.unwrap();
+        let mut empty = CreateNamespaceRequest::new();
+        empty.id = Some(vec!["empty".to_string()]);
+        writer.create_namespace(empty).await.unwrap();
+
+        let cached = DirectoryNamespaceBuilder::new(root)
+            .dir_listing_enabled(false)
+            .manifest_cache_mode(manifest::ManifestCacheMode::InMemory)
+            .build()
+            .await
+            .unwrap();
+
+        let mut parent_id = NamespaceExistsRequest::new();
+        parent_id.id = Some(vec!["parent".to_string()]);
+        cached
+            .namespace_exists(parent_id)
+            .await
+            .expect("cached reader should see parent in its pinned snapshot");
+
+        let mut child = CreateNamespaceRequest::new();
+        child.id = Some(vec!["parent".to_string(), "child".to_string()]);
+        writer.create_namespace(child).await.unwrap();
+
+        let mut drop_parent = DropNamespaceRequest::new();
+        drop_parent.id = Some(vec!["parent".to_string()]);
+        let err = cached
+            .drop_namespace(drop_parent)
+            .await
+            .expect_err("in_memory namespace instances must not orphan children");
+        let err = err.to_string();
+        assert!(err.contains("in_memory"), "{err}");
+
+        let verifier = DirectoryNamespaceBuilder::new(root)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+        let mut parent_id = NamespaceExistsRequest::new();
+        parent_id.id = Some(vec!["parent".to_string()]);
+        verifier.namespace_exists(parent_id).await.unwrap();
+        let mut child_id = NamespaceExistsRequest::new();
+        child_id.id = Some(vec!["parent".to_string(), "child".to_string()]);
+        verifier.namespace_exists(child_id).await.unwrap();
+
+        let mut drop_empty = DropNamespaceRequest::new();
+        drop_empty.id = Some(vec!["empty".to_string()]);
+        let err = cached
+            .drop_namespace(drop_empty)
+            .await
+            .expect_err("in_memory namespace instances must reject namespace drops");
+        let err = err.to_string();
+        assert!(err.contains("in_memory"), "{err}");
+
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["sibling".to_string()]);
+        let err = cached
+            .create_namespace(create_ns_req)
+            .await
+            .expect_err("in_memory namespace instances must reject namespace creation");
+        let err = err.to_string();
+        assert!(err.contains("in_memory"), "{err}");
+
+        let mut create_table_req = CreateTableRequest::new();
+        create_table_req.id = Some(vec!["table1".to_string()]);
+        let err = cached
+            .create_table(
+                create_table_req,
+                bytes::Bytes::from(create_test_ipc_data(&create_test_schema())),
+            )
+            .await
+            .expect_err("in_memory namespace instances must reject table creation");
+        let err = err.to_string();
+        assert!(err.contains("in_memory"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_manifest_cache_rejects_data_write_after_deregister() {
+        let temp_dir = TempStdDir::default();
+        let root = temp_dir.to_str().unwrap();
+
+        let writer = DirectoryNamespaceBuilder::new(root)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+        let mut create = CreateTableRequest::new();
+        create.id = Some(vec!["table1".to_string()]);
+        writer
+            .create_table(create, bytes::Bytes::from(create_non_empty_test_ipc_data()))
+            .await
+            .unwrap();
+
+        let cached = DirectoryNamespaceBuilder::new(root)
+            .dir_listing_enabled(false)
+            .manifest_cache_mode(manifest::ManifestCacheMode::InMemory)
+            .build()
+            .await
+            .unwrap();
+        let mut list = ListTablesRequest::new();
+        list.id = Some(vec![]);
+        assert_eq!(
+            cached.list_tables(list).await.unwrap().tables,
+            vec!["table1".to_string()]
+        );
+
+        let mut deregister = lance_namespace::models::DeregisterTableRequest::new();
+        deregister.id = Some(vec!["table1".to_string()]);
+        let location = writer
+            .deregister_table(deregister)
+            .await
+            .unwrap()
+            .location
+            .unwrap();
+
+        let delete = DeleteFromTableRequest {
+            id: Some(vec!["table1".to_string()]),
+            predicate: "id = 1".to_string(),
+            ..Default::default()
+        };
+        let err = cached
+            .delete_from_table(delete)
+            .await
+            .expect_err("in_memory namespace instances must reject data writes");
+        let err = err.to_string();
+        assert!(err.contains("in_memory"), "{err}");
+
+        let row_count = Dataset::open(&location)
+            .await
+            .unwrap()
+            .count_rows(None)
+            .await
+            .unwrap();
+        assert_eq!(row_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_manifest_cache_failed_write_keeps_pinned_snapshot() {
+        let temp_dir = TempStdDir::default();
+        let root = temp_dir.to_str().unwrap();
+
+        let writer = DirectoryNamespaceBuilder::new(root)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+        let mut first = CreateTableRequest::new();
+        first.id = Some(vec!["first".to_string()]);
+        writer
+            .create_table(
+                first,
+                bytes::Bytes::from(create_test_ipc_data(&create_test_schema())),
+            )
+            .await
+            .unwrap();
+
+        let cached = DirectoryNamespaceBuilder::new(root)
+            .dir_listing_enabled(false)
+            .manifest_cache_mode(manifest::ManifestCacheMode::InMemory)
+            .build()
+            .await
+            .unwrap();
+        let mut list = ListTablesRequest::new();
+        list.id = Some(vec![]);
+        assert_eq!(
+            cached.list_tables(list.clone()).await.unwrap().tables,
+            vec!["first".to_string()]
+        );
+
+        let mut second = CreateTableRequest::new();
+        second.id = Some(vec!["second".to_string()]);
+        writer
+            .create_table(
+                second,
+                bytes::Bytes::from(create_test_ipc_data(&create_test_schema())),
+            )
+            .await
+            .unwrap();
+
+        let mut create_namespace = CreateNamespaceRequest::new();
+        create_namespace.id = Some(vec!["other".to_string()]);
+        let err = cached
+            .create_namespace(create_namespace)
+            .await
+            .expect_err("in_memory namespace instances must reject catalog writes");
+        let err = err.to_string();
+        assert!(err.contains("in_memory"), "{err}");
+
+        assert_eq!(
+            cached.list_tables(list).await.unwrap().tables,
+            vec!["first".to_string()]
+        );
     }
 
     /// Migration mode promises manifest-first lookup even at the root, so a

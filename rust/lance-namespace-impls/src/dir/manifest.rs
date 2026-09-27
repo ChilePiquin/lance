@@ -227,12 +227,150 @@ struct ManifestTrainedIndex {
     created_index: CreatedIndex,
 }
 
+#[derive(Debug, Clone)]
 struct ManifestRowValue {
     object_id: String,
     object_type: ObjectType,
     location: Option<String>,
     metadata: Option<String>,
     base_objects: Option<Vec<String>>,
+}
+
+/// Read cache behavior for the directory manifest table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ManifestCacheMode {
+    /// Keep the existing behavior: check whether the manifest table has advanced
+    /// before each read and scan the current dataset.
+    #[default]
+    None,
+    /// Load the manifest rows into memory and reuse that snapshot for this
+    /// namespace instance. New namespace instances observe newer commits.
+    InMemory,
+}
+
+impl ManifestCacheMode {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "none" => Ok(Self::None),
+            "in_memory" => Ok(Self::InMemory),
+            other => Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "Invalid manifest_cache_mode '{}'; expected 'none' or 'in_memory'",
+                    other
+                ),
+            }
+            .into()),
+        }
+    }
+
+    fn is_in_memory(self) -> bool {
+        matches!(self, Self::InMemory)
+    }
+}
+
+#[derive(Debug)]
+struct ManifestSnapshot {
+    rows: Arc<[ManifestRowValue]>,
+}
+
+impl ManifestSnapshot {
+    async fn load(dataset: &Dataset) -> Result<Self> {
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&[
+                "object_id",
+                "object_type",
+                "location",
+                "metadata",
+                "base_objects",
+            ])
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!("Failed to project manifest columns: {:?}", e),
+                })
+            })?;
+
+        let batches = ManifestNamespace::execute_scanner(scanner).await?;
+        let mut rows = Vec::new();
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let object_ids = ManifestNamespace::get_string_column(&batch, "object_id")?;
+            let object_types = ManifestNamespace::get_string_column(&batch, "object_type")?;
+            let locations = ManifestNamespace::get_string_column(&batch, "location")?;
+            let metadatas = ManifestNamespace::get_string_column(&batch, "metadata")?;
+            let base_objects = ManifestNamespace::base_objects_column_values(&batch)?;
+            for (row, base_objects) in base_objects.into_iter().enumerate().take(batch.num_rows()) {
+                rows.push(ManifestRowValue {
+                    object_id: ManifestNamespace::required_string_value(
+                        object_ids,
+                        row,
+                        "object_id",
+                    )?
+                    .to_string(),
+                    object_type: ObjectType::parse(ManifestNamespace::required_string_value(
+                        object_types,
+                        row,
+                        "object_type",
+                    )?)?,
+                    location: ManifestNamespace::optional_string_value(locations, row),
+                    metadata: ManifestNamespace::optional_string_value(metadatas, row),
+                    base_objects,
+                });
+            }
+        }
+
+        rows.sort_by(|left, right| left.object_id.cmp(&right.object_id));
+        if let Some(duplicate) = rows
+            .windows(2)
+            .find(|pair| pair[0].object_id == pair[1].object_id)
+            .map(|pair| pair[0].object_id.clone())
+        {
+            return Err(NamespaceError::Internal {
+                message: format!("Manifest contains duplicate object_id '{}'", duplicate),
+            }
+            .into());
+        }
+
+        Ok(Self { rows: rows.into() })
+    }
+
+    fn get(&self, object_id: &str) -> Option<&ManifestRowValue> {
+        self.rows
+            .binary_search_by(|row| row.object_id.as_str().cmp(object_id))
+            .ok()
+            .map(|index| &self.rows[index])
+    }
+
+    fn direct_children<'a>(
+        &'a self,
+        parent: &[String],
+        object_type: ObjectType,
+    ) -> impl Iterator<Item = &'a ManifestRowValue> + 'a {
+        let parent_prefix =
+            (!parent.is_empty()).then(|| format!("{}{}", parent.join(DELIMITER), DELIMITER));
+        self.rows.iter().filter(move |row| {
+            if row.object_type != object_type {
+                return false;
+            }
+            match &parent_prefix {
+                Some(prefix) => row
+                    .object_id
+                    .strip_prefix(prefix)
+                    .is_some_and(|suffix| !suffix.contains(DELIMITER)),
+                None => !row.object_id.contains(DELIMITER),
+            }
+        })
+    }
+
+    fn descendant_count(&self, object_id: &str) -> usize {
+        let prefix = format!("{}{}", object_id, DELIMITER);
+        self.rows
+            .iter()
+            .filter(|row| row.object_id.starts_with(&prefix))
+            .count()
+    }
 }
 
 struct ManifestOutputRow<'a> {
@@ -600,12 +738,19 @@ pub struct NamespaceInfo {
 /// The manifest dataset uses contiguous attached versions and this module never
 /// runs old-version cleanup on it, allowing reads to check only the immediate
 /// successor manifest before deciding whether a reload is needed.
+#[derive(Debug)]
+struct ManifestDatasetState {
+    dataset: Dataset,
+    snapshot: Option<Arc<ManifestSnapshot>>,
+    cache_mode: ManifestCacheMode,
+}
+
 #[derive(Debug, Clone)]
-pub struct DatasetConsistencyWrapper(Arc<RwLock<Dataset>>);
+pub struct DatasetConsistencyWrapper(Arc<RwLock<ManifestDatasetState>>);
 
 impl DatasetConsistencyWrapper {
     /// Create a new wrapper with the given dataset.
-    pub fn new(dataset: Dataset) -> Self {
+    pub fn new(dataset: Dataset, cache_mode: ManifestCacheMode) -> Self {
         debug_assert!(
             !dataset
                 .manifest()
@@ -614,13 +759,21 @@ impl DatasetConsistencyWrapper {
                 .any(|key| key.starts_with("lance.auto_cleanup.")),
             "the directory manifest dataset must not enable old-version cleanup"
         );
-        Self(Arc::new(RwLock::new(dataset)))
+        Self(Arc::new(RwLock::new(ManifestDatasetState {
+            dataset,
+            snapshot: None,
+            cache_mode,
+        })))
     }
 
     /// Get an immutable reference to the dataset.
     /// Always reloads to ensure strong consistency.
     pub async fn get(&self) -> Result<DatasetReadGuard<'_>> {
-        self.reload().await?;
+        if self.cache_mode().await.is_in_memory() {
+            self.ensure_snapshot().await?;
+        } else {
+            self.reload().await?;
+        }
         let guard = DatasetReadGuard {
             guard: self.0.read().await,
         };
@@ -658,17 +811,51 @@ impl DatasetConsistencyWrapper {
     /// have the latest version.
     pub async fn set_latest(&self, dataset: Dataset) {
         let mut write_guard = self.0.write().await;
-        if dataset.manifest().version > write_guard.manifest().version {
-            *write_guard = dataset;
+        if dataset.manifest().version > write_guard.dataset.manifest().version {
+            write_guard.dataset = dataset;
+            write_guard.snapshot = None;
         }
+    }
+
+    async fn snapshot(&self) -> Result<Option<Arc<ManifestSnapshot>>> {
+        if !self.cache_mode().await.is_in_memory() {
+            return Ok(None);
+        }
+        self.ensure_snapshot().await?;
+        Ok(self.0.read().await.snapshot.clone())
+    }
+
+    async fn cache_mode(&self) -> ManifestCacheMode {
+        self.0.read().await.cache_mode
+    }
+
+    async fn is_in_memory_cache(&self) -> bool {
+        self.cache_mode().await.is_in_memory()
+    }
+
+    async fn ensure_snapshot(&self) -> Result<()> {
+        {
+            let read_guard = self.0.read().await;
+            if !read_guard.cache_mode.is_in_memory() || read_guard.snapshot.is_some() {
+                return Ok(());
+            }
+        }
+
+        let mut write_guard = self.0.write().await;
+        if write_guard.cache_mode.is_in_memory() && write_guard.snapshot.is_none() {
+            write_guard.snapshot = Some(Arc::new(
+                ManifestSnapshot::load(&write_guard.dataset).await?,
+            ));
+        }
+        Ok(())
     }
 
     /// Reload the dataset to the latest version.
     async fn reload(&self) -> Result<()> {
         // First check if we need to reload (with read lock)
         let read_guard = self.0.read().await;
-        let dataset_uri = read_guard.uri().to_string();
-        let current_version = read_guard.version().version;
+        let dataset_uri = read_guard.dataset.uri().to_string();
+        let current_version = read_guard.dataset.version().version;
         log::debug!(
             "Reload starting for uri={}, current_version={}",
             dataset_uri,
@@ -678,11 +865,16 @@ impl DatasetConsistencyWrapper {
         // does not run old-version cleanup, so the immediate successor probe is
         // enough to detect changes without resolving or loading the latest
         // manifest on every namespace read.
-        let has_successor_version = read_guard.has_successor_version().await.map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to check dataset staleness: {:?}", e),
-            })
-        })?;
+        let has_successor_version =
+            read_guard
+                .dataset
+                .has_successor_version()
+                .await
+                .map_err(|e| {
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!("Failed to check dataset staleness: {:?}", e),
+                    })
+                })?;
         log::debug!(
             "Reload checked successor_version_exists={} for uri={}, current_version={}",
             has_successor_version,
@@ -701,18 +893,30 @@ impl DatasetConsistencyWrapper {
         let mut write_guard = self.0.write().await;
 
         // Double-check after acquiring write lock (someone else might have reloaded)
-        let has_successor_version = write_guard.has_successor_version().await.map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to check dataset staleness: {:?}", e),
-            })
-        })?;
+        let has_successor_version =
+            write_guard
+                .dataset
+                .has_successor_version()
+                .await
+                .map_err(|e| {
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!("Failed to check dataset staleness: {:?}", e),
+                    })
+                })?;
 
         if has_successor_version {
-            write_guard.checkout_latest().await.map_err(|e| {
+            write_guard.dataset.checkout_latest().await.map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
                     message: format!("Failed to checkout latest: {:?}", e),
                 })
             })?;
+            write_guard.snapshot = None;
+        }
+
+        if write_guard.cache_mode.is_in_memory() {
+            write_guard.snapshot = Some(Arc::new(
+                ManifestSnapshot::load(&write_guard.dataset).await?,
+            ));
         }
 
         Ok(())
@@ -720,32 +924,32 @@ impl DatasetConsistencyWrapper {
 }
 
 pub struct DatasetReadGuard<'a> {
-    guard: RwLockReadGuard<'a, Dataset>,
+    guard: RwLockReadGuard<'a, ManifestDatasetState>,
 }
 
 impl Deref for DatasetReadGuard<'_> {
     type Target = Dataset;
 
     fn deref(&self) -> &Self::Target {
-        &self.guard
+        &self.guard.dataset
     }
 }
 
 pub struct DatasetWriteGuard<'a> {
-    guard: RwLockWriteGuard<'a, Dataset>,
+    guard: RwLockWriteGuard<'a, ManifestDatasetState>,
 }
 
 impl Deref for DatasetWriteGuard<'_> {
     type Target = Dataset;
 
     fn deref(&self) -> &Self::Target {
-        &self.guard
+        &self.guard.dataset
     }
 }
 
 impl DerefMut for DatasetWriteGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.guard
+        &mut self.guard.dataset
     }
 }
 
@@ -858,10 +1062,15 @@ impl ManifestNamespace {
         dir_listing_enabled: bool,
         inline_optimization_enabled: bool,
         commit_retries: Option<u32>,
+        manifest_cache_mode: ManifestCacheMode,
     ) -> Result<Self> {
-        let manifest_dataset =
-            Self::ensure_manifest_table_up_to_date(&root, &storage_options, session.clone())
-                .await?;
+        let manifest_dataset = Self::ensure_manifest_table_up_to_date(
+            &root,
+            &storage_options,
+            session.clone(),
+            manifest_cache_mode,
+        )
+        .await?;
 
         Ok(Self::new(
             root,
@@ -887,9 +1096,15 @@ impl ManifestNamespace {
         dir_listing_enabled: bool,
         inline_optimization_enabled: bool,
         commit_retries: Option<u32>,
+        manifest_cache_mode: ManifestCacheMode,
     ) -> Result<Self> {
-        let manifest_dataset =
-            Self::open_manifest_table(&root, &storage_options, session.clone()).await?;
+        let manifest_dataset = Self::open_manifest_table(
+            &root,
+            &storage_options,
+            session.clone(),
+            manifest_cache_mode,
+        )
+        .await?;
 
         Ok(Self::new(
             root,
@@ -1932,9 +2147,24 @@ impl ManifestNamespace {
     /// `rewrite_manifest` commit re-checks `ensure_writable` on each retry, so a
     /// concurrent upgrade in between is still caught.
     async fn ensure_manifest_writable(&self) -> Result<()> {
+        self.ensure_not_in_memory_cache_for_write("write manifest")
+            .await?;
         let dataset_guard = self.manifest_dataset.get().await?;
         ensure_can_write_manifest(dataset_guard.manifest())?;
         ensure_writable(dataset_guard.metadata())
+    }
+
+    async fn ensure_not_in_memory_cache_for_write(&self, operation: &str) -> Result<()> {
+        if self.manifest_dataset.is_in_memory_cache().await {
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "{} is not supported when manifest_cache_mode is in_memory",
+                    operation
+                ),
+            }
+            .into());
+        }
+        Ok(())
     }
 
     async fn rewrite_manifest<M, F>(
@@ -1946,6 +2176,8 @@ impl ManifestNamespace {
         M: ManifestStreamMutation + 'static,
         F: FnMut() -> M,
     {
+        self.ensure_not_in_memory_cache_for_write("rewrite manifest")
+            .await?;
         let _mutation_guard = self.manifest_mutation_lock.lock().await;
         let max_retries = self.manifest_rewrite_commit_retries();
         let mut retries = 0;
@@ -2114,6 +2346,10 @@ impl ManifestNamespace {
 
     /// Check if the manifest contains an object with the given ID
     async fn manifest_contains_object(&self, object_id: &str) -> Result<bool> {
+        if let Some(snapshot) = self.manifest_dataset.snapshot().await? {
+            return Ok(snapshot.get(object_id).is_some());
+        }
+
         let escaped_id = object_id.replace('\'', "''");
         let filter = format!("object_id = '{}'", escaped_id);
 
@@ -2146,6 +2382,14 @@ impl ManifestNamespace {
 
     /// Query the manifest for a table with the given object ID
     async fn query_manifest_for_table(&self, object_id: &str) -> Result<Option<TableInfo>> {
+        if let Some(snapshot) = self.manifest_dataset.snapshot().await? {
+            return snapshot
+                .get(object_id)
+                .filter(|row| row.object_type == ObjectType::Table)
+                .map(Self::table_info_from_manifest_row)
+                .transpose();
+        }
+
         let escaped_id = object_id.replace('\'', "''");
         let filter = format!("object_id = '{}' AND object_type = 'table'", escaped_id);
         let mut scanner = self.manifest_scanner().await?;
@@ -2215,6 +2459,58 @@ impl ManifestNamespace {
         Ok(found_result)
     }
 
+    fn deserialize_manifest_metadata(
+        object_type: &str,
+        object_id: &str,
+        metadata: Option<&str>,
+    ) -> Result<Option<HashMap<String, String>>> {
+        let Some(metadata_str) = metadata else {
+            return Ok(None);
+        };
+        serde_json::from_str::<HashMap<String, String>>(metadata_str)
+            .map(Some)
+            .map_err(|e| {
+                NamespaceError::Internal {
+                    message: format!(
+                        "Failed to deserialize metadata for {} '{}': {}",
+                        object_type, object_id, e
+                    ),
+                }
+                .into()
+            })
+    }
+
+    fn table_info_from_manifest_row(row: &ManifestRowValue) -> Result<TableInfo> {
+        let location = row.location.clone().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Manifest table '{}' has no location", row.object_id),
+            })
+        })?;
+        let metadata =
+            Self::deserialize_manifest_metadata("table", &row.object_id, row.metadata.as_deref())?;
+        let (namespace, name) = Self::parse_object_id(&row.object_id);
+        Ok(TableInfo {
+            namespace,
+            name,
+            location,
+            metadata,
+        })
+    }
+
+    fn namespace_info_from_manifest_row(row: &ManifestRowValue) -> Result<NamespaceInfo> {
+        let metadata = Self::deserialize_manifest_metadata(
+            "namespace",
+            &row.object_id,
+            row.metadata.as_deref(),
+        )?;
+        let (namespace, name) = Self::parse_object_id(&row.object_id);
+        Ok(NamespaceInfo {
+            namespace,
+            name,
+            metadata,
+        })
+    }
+
     fn serialize_metadata(
         properties: Option<&HashMap<String, String>>,
         object_type: &str,
@@ -2277,6 +2573,13 @@ impl ManifestNamespace {
     /// List all table locations in the manifest (for root namespace only)
     /// Returns a set of table locations (e.g., "table_name.lance")
     pub async fn list_manifest_table_locations(&self) -> Result<std::collections::HashSet<String>> {
+        if let Some(snapshot) = self.manifest_dataset.snapshot().await? {
+            return Ok(snapshot
+                .direct_children(&[], ObjectType::Table)
+                .filter_map(|row| row.location.clone())
+                .collect());
+        }
+
         let filter = "object_type = 'table' AND NOT contains(object_id, '$')";
         let mut scanner = self.manifest_scanner().await?;
         scanner.filter(filter).map_err(|e| {
@@ -2404,6 +2707,14 @@ impl ManifestNamespace {
 
     /// Query the manifest for a namespace with the given object ID
     async fn query_manifest_for_namespace(&self, object_id: &str) -> Result<Option<NamespaceInfo>> {
+        if let Some(snapshot) = self.manifest_dataset.snapshot().await? {
+            return snapshot
+                .get(object_id)
+                .filter(|row| row.object_type == ObjectType::Namespace)
+                .map(Self::namespace_info_from_manifest_row)
+                .transpose();
+        }
+
         let escaped_id = object_id.replace('\'', "''");
         let filter = format!("object_id = '{}' AND object_type = 'namespace'", escaped_id);
         let mut scanner = self.manifest_scanner().await?;
@@ -2476,6 +2787,7 @@ impl ManifestNamespace {
         root: &str,
         storage_options: &Option<HashMap<String, String>>,
         session: Option<Arc<Session>>,
+        manifest_cache_mode: ManifestCacheMode,
     ) -> Result<DatasetConsistencyWrapper> {
         let manifest_path = format!("{}/{}", root, MANIFEST_TABLE_NAME);
         log::debug!("Attempting to load manifest from {}", manifest_path);
@@ -2499,7 +2811,7 @@ impl ManifestNamespace {
             .load()
             .await?;
         ensure_readable(dataset.metadata())?;
-        Ok(DatasetConsistencyWrapper::new(dataset))
+        Ok(DatasetConsistencyWrapper::new(dataset, manifest_cache_mode))
     }
 
     /// Create or load the manifest dataset, ensuring it has the latest schema setup.
@@ -2512,6 +2824,7 @@ impl ManifestNamespace {
         root: &str,
         storage_options: &Option<HashMap<String, String>>,
         session: Option<Arc<Session>>,
+        manifest_cache_mode: ManifestCacheMode,
     ) -> Result<DatasetConsistencyWrapper> {
         let manifest_path = format!("{}/{}", root, MANIFEST_TABLE_NAME);
         log::debug!("Attempting to load manifest from {}", manifest_path);
@@ -2576,7 +2889,7 @@ impl ManifestNamespace {
                         })?;
                 }
 
-                Ok(DatasetConsistencyWrapper::new(dataset))
+                Ok(DatasetConsistencyWrapper::new(dataset, manifest_cache_mode))
             }
             Err(err) if Self::is_not_found_load_error(&err) => {
                 log::info!("Creating new manifest table at {}", manifest_path);
@@ -2612,7 +2925,7 @@ impl ManifestNamespace {
                             dataset.version().version,
                             dataset.uri()
                         );
-                        Ok(DatasetConsistencyWrapper::new(dataset))
+                        Ok(DatasetConsistencyWrapper::new(dataset, manifest_cache_mode))
                     }
                     Err(ref e)
                         if matches!(
@@ -2655,7 +2968,7 @@ impl ManifestNamespace {
                                     ),
                                 })
                             })?;
-                        Ok(DatasetConsistencyWrapper::new(dataset))
+                        Ok(DatasetConsistencyWrapper::new(dataset, manifest_cache_mode))
                     }
                     Err(e) => Err(lance_core::Error::from(NamespaceError::Internal {
                         message: format!("Failed to create manifest dataset: {:?}", e),
@@ -2719,6 +3032,50 @@ impl LanceNamespace for ManifestNamespace {
                 message: "Namespace ID is required".to_string(),
             })
         })?;
+
+        if let Some(snapshot) = self.manifest_dataset.snapshot().await? {
+            let table_entries: Vec<(String, String)> = snapshot
+                .direct_children(namespace_id, ObjectType::Table)
+                .map(|row| {
+                    let (_namespace, name) = Self::parse_object_id(&row.object_id);
+                    let location = row.location.clone().ok_or_else(|| {
+                        lance_core::Error::from(NamespaceError::Internal {
+                            message: format!("Manifest table '{}' has no location", row.object_id),
+                        })
+                    })?;
+                    Ok::<_, Error>((name, location))
+                })
+                .collect::<Result<_>>()?;
+
+            let mut tables: Vec<String> = if request.include_declared.unwrap_or(true) {
+                table_entries.into_iter().map(|(name, _)| name).collect()
+            } else {
+                let mut stream = futures::stream::iter(table_entries.into_iter().map(
+                    |(name, location)| async move {
+                        if self.location_has_actual_manifests(&location).await? {
+                            Ok::<Option<String>, Error>(Some(name))
+                        } else {
+                            Ok::<Option<String>, Error>(None)
+                        }
+                    },
+                ))
+                .buffered(DECLARED_FILTER_CONCURRENCY);
+
+                let mut filtered = Vec::new();
+                while let Some(result) = stream.next().await {
+                    if let Some(name) = result? {
+                        filtered.push(name);
+                    }
+                }
+                filtered
+            };
+
+            let next_page_token =
+                Self::apply_pagination(&mut tables, request.page_token, request.limit);
+            let mut response = ListTablesResponse::new(tables);
+            response.page_token = next_page_token;
+            return Ok(response);
+        }
 
         // Build filter to find tables in this namespace
         let filter = if namespace_id.is_empty() {
@@ -3222,6 +3579,21 @@ impl LanceNamespace for ManifestNamespace {
             })
         })?;
 
+        if let Some(snapshot) = self.manifest_dataset.snapshot().await? {
+            let mut namespaces: Vec<String> = snapshot
+                .direct_children(parent_namespace, ObjectType::Namespace)
+                .map(|row| {
+                    let (_namespace, name) = Self::parse_object_id(&row.object_id);
+                    name
+                })
+                .collect();
+            let next_page_token =
+                Self::apply_pagination(&mut namespaces, request.page_token, request.limit);
+            let mut response = ListNamespacesResponse::new(namespaces);
+            response.page_token = next_page_token;
+            return Ok(response);
+        }
+
         // Build filter to find direct child namespaces
         let filter = if parent_namespace.is_empty() {
             // Root namespace: find all namespaces without a parent
@@ -3383,6 +3755,18 @@ impl LanceNamespace for ManifestNamespace {
                 message: object_id.to_string(),
             }
             .into());
+        }
+
+        if let Some(snapshot) = self.manifest_dataset.snapshot().await? {
+            let count = snapshot.descendant_count(&object_id);
+            if count > 0 {
+                return Err(NamespaceError::NamespaceNotEmpty {
+                    message: format!("'{}' (contains {} child objects)", object_id, count),
+                }
+                .into());
+            }
+            self.delete_from_manifest(&object_id).boxed().await?;
+            return Ok(DropNamespaceResponse::default());
         }
 
         // Check for child namespaces
@@ -3681,6 +4065,8 @@ impl LanceNamespace for ManifestNamespace {
         &self,
         request: AlterTableAddColumnsRequest,
     ) -> Result<AlterTableAddColumnsResponse> {
+        self.ensure_not_in_memory_cache_for_write("alter_table_add_columns")
+            .await?;
         let table_id = request
             .id
             .as_ref()
@@ -3746,6 +4132,8 @@ impl LanceNamespace for ManifestNamespace {
         &self,
         request: AlterTableAlterColumnsRequest,
     ) -> Result<AlterTableAlterColumnsResponse> {
+        self.ensure_not_in_memory_cache_for_write("alter_table_alter_columns")
+            .await?;
         let table_id = request
             .id
             .as_ref()
@@ -3798,6 +4186,8 @@ impl LanceNamespace for ManifestNamespace {
         &self,
         request: AlterTableDropColumnsRequest,
     ) -> Result<AlterTableDropColumnsResponse> {
+        self.ensure_not_in_memory_cache_for_write("alter_table_drop_columns")
+            .await?;
         let table_id = request
             .id
             .as_ref()
@@ -3847,9 +4237,9 @@ mod tests {
     use super::{
         BASE_OBJECTS_INDEX_NAME, ConflictResolution, CopyOnWriteMutation, DeleteObjectMutation,
         LANCE_DATA_DIR, LANCE_INDICES_DIR, MANIFEST_TABLE_NAME, ManifestBatchBuilder,
-        ManifestEntry, ManifestIndexAccumulator, ManifestNamespace, ManifestOutputRow,
-        ManifestRowValue, ManifestStreamMutation, OBJECT_ID_INDEX_NAME, OBJECT_TYPE_INDEX_NAME,
-        ObjectType,
+        ManifestCacheMode, ManifestEntry, ManifestIndexAccumulator, ManifestNamespace,
+        ManifestOutputRow, ManifestRowValue, ManifestStreamMutation, OBJECT_ID_INDEX_NAME,
+        OBJECT_TYPE_INDEX_NAME, ObjectType,
     };
     use crate::DirectoryNamespaceBuilder;
     use arrow::datatypes::DataType;
@@ -3897,6 +4287,7 @@ mod tests {
             true,
             inline_optimization_enabled,
             commit_retries,
+            ManifestCacheMode::None,
         )
         .await
         .unwrap()
