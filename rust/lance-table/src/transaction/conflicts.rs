@@ -26,6 +26,8 @@ impl PartialEq for Operation {
             a.len() == b.len() && a.iter().all(|f| b.contains(f))
         }
         match (self, other) {
+            (Self::Pin(a), Self::Pin(b)) => a == b,
+            (Self::Pin(_), _) | (_, Self::Pin(_)) => false,
             (Self::Append { fragments: a }, Self::Append { fragments: b }) => compare_vec(a, b),
             (
                 Self::Clone {
@@ -920,6 +922,8 @@ impl Operation {
 
     pub fn modifies_same_metadata(&self, other: &Self) -> bool {
         match (self, other) {
+            (Self::Pin(a), Self::Pin(b)) => a == b,
+            (Self::Pin(_), _) | (_, Self::Pin(_)) => false,
             (
                 Self::UpdateConfig {
                     table_metadata_updates,

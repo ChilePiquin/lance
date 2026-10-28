@@ -120,6 +120,9 @@ pub struct Manifest {
     /// first. Allocation takes `max_clustering_id + 1` and the value never
     /// decreases, including after definition removal or restore.
     pub max_clustering_id: u32,
+
+    /// Authoritative retention consumers when this is the current attached manifest.
+    pub ongoing_work_pins: Vec<super::OngoingWorkPin>,
 }
 
 // We use the most significant bit to indicate that a transaction is detached
@@ -223,6 +226,7 @@ impl Manifest {
             base_paths,
             clustering: Vec::new(),
             max_clustering_id: 0,
+            ongoing_work_pins: Vec::new(),
         }
     }
 
@@ -257,6 +261,7 @@ impl Manifest {
             base_paths: previous.base_paths.clone(),
             clustering: previous.clustering.clone(),
             max_clustering_id: previous.max_clustering_id,
+            ongoing_work_pins: previous.ongoing_work_pins.clone(),
         }
     }
 
@@ -338,6 +343,7 @@ impl Manifest {
             // the definitions they reference and the allocation high-water mark.
             clustering: self.clustering.clone(),
             max_clustering_id: self.max_clustering_id,
+            ongoing_work_pins: Vec::new(),
         }
     }
 
@@ -1159,6 +1165,11 @@ impl TryFrom<pb::Manifest> for Manifest {
                 .map(ClusteringDefinition::try_from)
                 .collect::<Result<Vec<_>>>()?,
             max_clustering_id: p.max_clustering_id,
+            ongoing_work_pins: p
+                .ongoing_work_pins
+                .into_iter()
+                .map(super::OngoingWorkPin::try_from)
+                .collect::<Result<_>>()?,
         })
     }
 }
@@ -1188,8 +1199,11 @@ impl From<&Manifest> for pb::Manifest {
             branch: m.branch.clone(),
             clustering: m.clustering.iter().map(pb::Clustering::from).collect(),
             max_clustering_id: m.max_clustering_id,
-            // Pin-aware writes are gated by the unsupported writer capability.
-            ongoing_work_pins: Vec::new(),
+            ongoing_work_pins: m
+                .ongoing_work_pins
+                .iter()
+                .map(pb::OngoingWorkPin::from)
+                .collect(),
             writer_version: m
                 .writer_version
                 .as_ref()

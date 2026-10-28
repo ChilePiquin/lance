@@ -579,6 +579,7 @@ async fn do_commit_new_dataset(
         } else {
             // Deep clone: build a manifest that references local files (no external bases)
             let mut new_manifest = source_manifest.clone();
+            new_manifest.ongoing_work_pins.clear();
             if !source_manifest.has_managed_blobs() {
                 new_manifest.base_paths.clear();
             }
@@ -1340,6 +1341,13 @@ pub(crate) async fn do_commit_detached_transaction(
              fragment reuse entry; commit the rewrite on the main version chain",
         ));
     }
+    if matches!(transaction.operation, Operation::Pin(_))
+        || !dataset.manifest.ongoing_work_pins.is_empty()
+    {
+        return Err(Error::not_supported(
+            "detached commits cannot own ongoing-work pins",
+        ));
+    }
     let pb_transaction = pb::Transaction::try_from(transaction)?;
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
     // Classified from the operation itself. Reading it back off the inline
@@ -1737,15 +1745,16 @@ pub(crate) async fn commit_transaction(
     // Strict overwrites are not subject to any sort of automatic conflict resolution.
     let strict_overwrite = matches!(transaction.operation, Operation::Overwrite { .. })
         && commit_config.num_retries == 0;
-    let mut dataset =
-        if dataset.manifest.version != read_version && (read_version != 0 || strict_overwrite) {
-            // If the dataset version is not the same as the read version, we need to
-            // checkout the read version.
-            dataset.checkout_version(read_version).await?
-        } else {
-            // If the dataset version is the same as the read version, we can use it directly.
-            dataset.clone()
-        };
+    let mut dataset = if matches!(transaction.operation, Operation::Pin(_)) {
+        dataset.current_for_ongoing_work().await?
+    } else if dataset.manifest.version != read_version && (read_version != 0 || strict_overwrite) {
+        // If the dataset version is not the same as the read version, we need to
+        // checkout the read version.
+        dataset.checkout_version(read_version).await?
+    } else {
+        // If the dataset version is the same as the read version, we can use it directly.
+        dataset.clone()
+    };
 
     // The version this transaction read, captured before the retry loop moves
     // `dataset` forward. MemWAL index catch-up is derived from it: an index
@@ -1800,7 +1809,36 @@ pub(crate) async fn commit_transaction(
         // faster and the slow path slower, which makes performance less predictable
         // for users. So we always check for other transactions.
         // We skip this for strict overwrites, because strict overwrites can't be rebased.
-        if !strict_overwrite {
+        if let Operation::Pin(operation) = &transaction.operation {
+            dataset = dataset.current_for_ongoing_work().await?;
+            ensure_can_write_manifest(&dataset.manifest)?;
+            if let lance_table::transaction::PinOperation::Register {
+                source_transaction_uuid,
+                ..
+            } = operation
+            {
+                if !dataset
+                    .manifest
+                    .ongoing_work_pins
+                    .iter()
+                    .any(|p| p.id == transaction.uuid)
+                    && (dataset.manifest.version != transaction.read_version
+                        || dataset.ongoing_work_source_id().await? != *source_transaction_uuid)
+                {
+                    return Err(Error::commit_conflict_source(
+                        dataset.manifest.version,
+                        "pin registration source is no longer current".into(),
+                    ));
+                }
+            }
+            let mut state = dataset.manifest.as_ref().clone();
+            if !operation.apply(&transaction, &mut state)? {
+                return Ok((
+                    dataset.manifest.as_ref().clone(),
+                    dataset.manifest_location.clone(),
+                ));
+            }
+        } else if !strict_overwrite {
             let checked_since = dataset.manifest.version;
             (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;
 
@@ -1861,6 +1899,21 @@ pub(crate) async fn commit_transaction(
             tagged_rewrite = assembly;
         } else {
             ensure_can_write_manifest(&dataset.manifest)?;
+        }
+        if dataset.manifest.writer_feature_flags
+            & lance_table::feature_flags::FLAG_ONGOING_WORK_PINS
+            != 0
+        {
+            let current = dataset.current_for_ongoing_work().await?;
+            if current.manifest.version != dataset.manifest.version
+                || current.ongoing_work_source_id().await?
+                    != dataset.ongoing_work_source_id().await?
+            {
+                return Err(Error::retryable_commit_conflict_source(
+                    current.manifest.version,
+                    "ongoing-work state advanced beyond commit replay; reload and retry".into(),
+                ));
+            }
         }
         let attempt_start = Instant::now();
         let retry_start = *retry_start.get_or_insert(attempt_start);

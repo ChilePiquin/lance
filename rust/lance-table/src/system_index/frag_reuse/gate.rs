@@ -300,7 +300,8 @@ pub fn classify(
         // (`retain_relevant_indices` still drops an index on a removed
         // field) or the whole table (Overwrite discards every index, the
         // entry included; the sticky flag keeps the tagged record form).
-        Operation::Append { .. }
+        Operation::Pin(_)
+        | Operation::Append { .. }
         | Operation::ReserveFragments { .. }
         | Operation::Delete { .. }
         | Operation::Update { .. }

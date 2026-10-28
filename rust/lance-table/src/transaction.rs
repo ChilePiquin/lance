@@ -32,6 +32,8 @@ mod conflicts;
 mod index_maintenance;
 mod manifest_build;
 mod operation;
+mod pins;
+pub use pins::PinOperation;
 mod prepare;
 mod proto;
 mod row_version;

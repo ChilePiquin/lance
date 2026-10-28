@@ -210,6 +210,7 @@ impl Transaction {
         // republish the referenced files as legacy-compatible.
         ensure_can_read_manifest(&manifest)?;
         ensure_can_write_manifest(&manifest)?;
+        manifest.ongoing_work_pins = current_manifest.ongoing_work_pins.clone();
         manifest.set_timestamp(config.timestamp_nanos);
         manifest.transaction_file = Some(tx_path.to_string());
         let indices = read_manifest_indexes(object_store, &location, &manifest).await?;
@@ -839,6 +840,59 @@ impl Transaction {
                     ))
                 });
 
+        if let Some(current) = current_manifest {
+            current.validate_ongoing_work_pins()?;
+            if let Some(id) = self
+                .transaction_properties
+                .as_ref()
+                .and_then(|p| p.get("lance.ongoing_work_pin"))
+            {
+                if !current.ongoing_work_pins.iter().any(|p| &p.id == id) {
+                    return Err(Error::invalid_input(format!(
+                        "ongoing-work pin {id} is no longer active; rebuild before publishing"
+                    )));
+                }
+            }
+            if !current.ongoing_work_pins.is_empty() {
+                if config.migration_next_row_id.is_some() {
+                    return Err(Error::invalid_input(
+                        "cannot migrate row IDs while ongoing work retains fragment lineage",
+                    ));
+                }
+                match &self.operation {
+                    Operation::Rewrite {
+                        groups,
+                        frag_reuse_index: None,
+                        ..
+                    } if !groups.is_empty() => {
+                        return Err(Error::retryable_commit_conflict_source(current.version,
+                            "active ongoing work requires fragment reuse recording; replan with deferred remapping".into()));
+                    }
+                    Operation::CreateIndex {
+                        new_indices,
+                        removed_indices,
+                    } if new_indices
+                        .iter()
+                        .chain(removed_indices.iter())
+                        .any(|i| i.name == FRAG_REUSE_INDEX_NAME) =>
+                    {
+                        return Err(Error::retryable_commit_conflict_source(
+                            current.version,
+                            "active ongoing work prevents fragment reuse history replacement"
+                                .into(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut pin_state = current_manifest.cloned();
+        if let Operation::Pin(operation) = &self.operation {
+            let state = pin_state
+                .as_mut()
+                .ok_or_else(|| Error::invalid_input("pins require an existing dataset"))?;
+            operation.apply(self, state)?;
+        }
         let new_version = current_manifest.map_or(1, |m| m.version + 1);
 
         match &self.operation {
@@ -1784,7 +1838,7 @@ impl Transaction {
                     compacted_sstables.clone(),
                 )?;
             }
-            Operation::UpdateBases { .. } => {
+            Operation::Pin(_) | Operation::UpdateBases { .. } => {
                 // UpdateBases operation doesn't modify fragments or indices
                 // Base paths are handled in the manifest creation section below
                 final_fragments.extend(maybe_existing_fragments?.clone());
@@ -2164,6 +2218,11 @@ impl Transaction {
         apply_range_segments(&mut manifest, current_manifest)?;
 
         // Handle UpdateBases operation to update manifest base_paths
+        if let Some(state) = pin_state {
+            manifest.ongoing_work_pins = state.ongoing_work_pins;
+            manifest.writer_feature_flags |=
+                state.writer_feature_flags & crate::feature_flags::FLAG_ONGOING_WORK_PINS;
+        }
         if let Operation::UpdateBases { new_bases } = &self.operation {
             // Validate and add new base paths to the manifest
             for new_base in new_bases {

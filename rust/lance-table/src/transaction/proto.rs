@@ -404,12 +404,47 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(DataOverlayGroup::try_from)
                     .collect::<Result<Vec<_>>>()?,
             },
-            // Reserved format operations remain unsupported until runtime
-            // handling is implemented. Unknown operations fail closed.
-            Some(pb::transaction::Operation::RegisterPin(_))
-            | Some(pb::transaction::Operation::RenewPin(_))
-            | Some(pb::transaction::Operation::ReleasePin(_))
-            | Some(pb::transaction::Operation::ExpirePins(_)) => Operation::Unknown {},
+            Some(pb::transaction::Operation::RegisterPin(p)) => {
+                Operation::Pin(super::PinOperation::Register {
+                    source_transaction_uuid: p
+                        .source_transaction_uuid
+                        .ok_or_else(|| Error::invalid_input("missing pin source UUID"))?,
+                    created_at: crate::format::PinTime::from_proto(p.created_at)?,
+                    expires_at: crate::format::PinTime::from_proto(p.expires_at)?,
+                    job_label: p.job_label,
+                })
+            }
+            Some(pb::transaction::Operation::RenewPin(p)) => {
+                Operation::Pin(super::PinOperation::Renew {
+                    pin_id: p
+                        .pin_id
+                        .ok_or_else(|| Error::invalid_input("missing pin ID"))?,
+                    expires_at: crate::format::PinTime::from_proto(p.expires_at)?,
+                })
+            }
+            Some(pb::transaction::Operation::ReleasePin(p)) => {
+                Operation::Pin(super::PinOperation::Release {
+                    pin_id: p
+                        .pin_id
+                        .ok_or_else(|| Error::invalid_input("missing pin ID"))?,
+                })
+            }
+            Some(pb::transaction::Operation::ExpirePins(p)) => {
+                Operation::Pin(super::PinOperation::Expire {
+                    observed_at: crate::format::PinTime::from_proto(p.observed_at)?,
+                    candidates: p
+                        .candidates
+                        .into_iter()
+                        .map(|c| {
+                            Ok((
+                                c.pin_id
+                                    .ok_or_else(|| Error::invalid_input("missing pin ID"))?,
+                                crate::format::PinTime::from_proto(c.expected_expires_at)?,
+                            ))
+                        })
+                        .collect::<Result<_>>()?,
+                })
+            }
             // prost drops unrecognized oneof fields, so an operation from a
             // newer writer is indistinguishable from a missing one.
             None => Operation::Unknown {},
@@ -717,6 +752,43 @@ impl TryFrom<&Transaction> for pb::Transaction {
                         .collect::<Vec<pb::BasePath>>(),
                 })
             }
+            Operation::Pin(pin) => match pin {
+                super::PinOperation::Register {
+                    source_transaction_uuid,
+                    created_at,
+                    expires_at,
+                    job_label,
+                } => pb::transaction::Operation::RegisterPin(pb::transaction::RegisterPin {
+                    source_transaction_uuid: Some(source_transaction_uuid.clone()),
+                    created_at: Some(created_at.to_proto()),
+                    expires_at: Some(expires_at.to_proto()),
+                    job_label: job_label.clone(),
+                }),
+                super::PinOperation::Renew { pin_id, expires_at } => {
+                    pb::transaction::Operation::RenewPin(pb::transaction::RenewPin {
+                        pin_id: Some(pin_id.clone()),
+                        expires_at: Some(expires_at.to_proto()),
+                    })
+                }
+                super::PinOperation::Release { pin_id } => {
+                    pb::transaction::Operation::ReleasePin(pb::transaction::ReleasePin {
+                        pin_id: Some(pin_id.clone()),
+                    })
+                }
+                super::PinOperation::Expire {
+                    observed_at,
+                    candidates,
+                } => pb::transaction::Operation::ExpirePins(pb::transaction::ExpirePins {
+                    observed_at: Some(observed_at.to_proto()),
+                    candidates: candidates
+                        .iter()
+                        .map(|(id, expiry)| pb::transaction::expire_pins::Candidate {
+                            pin_id: Some(id.clone()),
+                            expected_expires_at: Some(expiry.to_proto()),
+                        })
+                        .collect(),
+                }),
+            },
             Operation::Unknown { .. } => {
                 return Err(Error::not_supported(format!(
                     "Transaction {} has an operation written by a newer version of Lance \
@@ -839,7 +911,7 @@ mod tests {
     #[case::renew(pb::transaction::Operation::RenewPin(Default::default()))]
     #[case::release(pb::transaction::Operation::ReleasePin(Default::default()))]
     #[case::expire(pb::transaction::Operation::ExpirePins(Default::default()))]
-    fn test_ongoing_work_pin_operations_remain_unsupported(
+    fn test_incomplete_ongoing_work_pin_operations_are_rejected(
         #[case] operation: pb::transaction::Operation,
     ) {
         let message = pb::Transaction {
@@ -849,13 +921,8 @@ mod tests {
             ..Default::default()
         };
         let decoded = pb::Transaction::decode(message.encode_to_vec().as_slice()).unwrap();
-        let transaction = Transaction::try_from(decoded).unwrap();
-        assert!(matches!(transaction.operation, Operation::Unknown {}));
-        assert_eq!(transaction.read_version, 12);
-        assert_eq!(transaction.uuid, "pin-operation");
-        let error = pb::Transaction::try_from(&transaction).unwrap_err();
-        assert!(matches!(error, Error::NotSupported { .. }));
-        assert!(error.to_string().contains("cannot be re-encoded"));
+        let error = Transaction::try_from(decoded).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
     }
 
     #[test]

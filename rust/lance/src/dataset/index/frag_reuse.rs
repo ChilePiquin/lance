@@ -119,6 +119,12 @@ impl Dataset {
 /// [`compact_files`]: crate::dataset::optimize::compact_files
 /// [`remap_column_index`]: crate::dataset::optimize::remapping::remap_column_index
 pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Result<()> {
+    let current = dataset.current_for_ongoing_work().await?;
+    current.manifest.validate_ongoing_work_pins()?;
+    if !current.manifest.ongoing_work_pins.is_empty() {
+        return Ok(());
+    }
+
     // check against index metadata before auto-remap
     let indices = read_manifest_indexes(
         &dataset.object_store,

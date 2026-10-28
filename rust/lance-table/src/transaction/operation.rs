@@ -37,6 +37,8 @@ pub struct DataOverlayGroup {
 /// An operation on a dataset.
 #[derive(Debug, Clone, DeepSizeOf)]
 pub enum Operation {
+    /// Mutate the authoritative ongoing-work retention list.
+    Pin(super::PinOperation),
     /// Adding new fragments to the dataset. The fragments contained within
     /// haven't yet been assigned a final ID.
     Append { fragments: Vec<Fragment> },
@@ -307,6 +309,7 @@ impl std::fmt::Display for Operation {
             Self::DataReplacement { .. } => write!(f, "DataReplacement"),
             Self::DataOverlay { .. } => write!(f, "DataOverlay"),
             Self::Unknown { .. } => write!(f, "Unknown"),
+            Self::Pin(pin) => write!(f, "{}", pin.name()),
             Self::Clone { .. } => write!(f, "Clone"),
             Self::UpdateMemWalState { .. } => write!(f, "UpdateMemWalState"),
             Self::UpdateBases { .. } => write!(f, "UpdateBases"),
@@ -428,6 +431,7 @@ impl Operation {
             Self::DataReplacement { .. } => "DataReplacement",
             Self::DataOverlay { .. } => "DataOverlay",
             Self::Unknown { .. } => "Unknown",
+            Self::Pin(pin) => pin.name(),
             Self::UpdateMemWalState { .. } => "UpdateMemWalState",
             Self::Clone { .. } => "Clone",
             Self::UpdateBases { .. } => "UpdateBases",

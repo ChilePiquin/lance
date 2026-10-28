@@ -549,6 +549,17 @@ impl<'a> CleanupOperation<'a> {
     /// Execute cleanup by re-evaluating the current dataset state.
     pub async fn execute(&self) -> Result<RemovalStats> {
         info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&self.dataset.uri);
+        let current = self.dataset.current_for_ongoing_work().await?;
+        if !current.manifest.ongoing_work_pins.is_empty() {
+            let now = Utc::now();
+            Box::pin(
+                current.expire_ongoing_work_pins(lance_table::format::PinTime {
+                    seconds: now.timestamp(),
+                    nanos: now.timestamp_subsec_nanos() as i32,
+                }),
+            )
+            .await?;
+        }
         let cleanup = CleanupTask::new(self, CleanupAction::Execute)?;
         Ok(cleanup.run().await?.stats)
     }
@@ -611,7 +622,17 @@ impl<'a> CleanupTask<'a> {
         })
     }
 
-    async fn run(self) -> Result<CleanupRunResult> {
+    async fn run(mut self) -> Result<CleanupRunResult> {
+        let current = self.dataset.current_for_ongoing_work().await?;
+        for pin in &current.manifest.ongoing_work_pins {
+            current.validate_ongoing_work_source(pin).await?;
+        }
+        // Replay of a staged index needs every intervening transaction, not only
+        // its source snapshot. Conservatively retain the entire suffix and its files.
+        if let Some(horizon) = current.manifest.ongoing_work_horizon() {
+            self.read_version = self.read_version.min(horizon);
+        }
+
         let mut final_result = CleanupRunResult::default();
         let candidate_file_limit = self.action.candidate_file_limit();
         // First check if we need to clean referenced branches

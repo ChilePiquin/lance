@@ -4041,7 +4041,11 @@ pub async fn commit_compaction(
     // the current entry turns out tagged (see `finish_rewrite`); the commit
     // gate still rejects a v0 entry spliced by a writer without that
     // conversion.
-    let frag_reuse_index = if records_row_addrs && (uses_stable_row_ids || any_group_indexed) {
+    let frag_reuse_index = if records_row_addrs
+        && (uses_stable_row_ids
+            || any_group_indexed
+            || !dataset.manifest.ongoing_work_pins.is_empty())
+    {
         // Once a table is v1, it stays v1: the sticky
         // FLAG_FRAGMENT_REUSE_INDEX is the final authority
         // (`uses_tagged_fri`), never the entry's own index_version. With NO

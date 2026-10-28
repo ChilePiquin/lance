@@ -258,6 +258,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateMemWalState { .. }
             | Operation::Clone { .. }
             | Operation::Restore { .. }
+            | Operation::Pin(_)
             | Operation::UpdateBases { .. } => {
                 let is_create_index =
                     matches!(transaction.operation, Operation::CreateIndex { .. });
@@ -635,6 +636,17 @@ impl<'a> TransactionRebase<'a> {
     }
 
     pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {
+        if matches!(
+            self.transaction.operation,
+            Operation::Pin(lance_table::transaction::PinOperation::Register { .. })
+        ) {
+            return Err(self.retryable_conflict_err(other_transaction, other_version));
+        }
+        if matches!(self.transaction.operation, Operation::Pin(_))
+            || matches!(other_transaction.operation, Operation::Pin(_))
+        {
+            return Ok(());
+        }
         // Either order: the claim was checked without the write's data.
         let ours = &self.transaction.operation;
         let theirs = &other_transaction.operation;
@@ -664,6 +676,7 @@ impl<'a> TransactionRebase<'a> {
 
         let op = &self.transaction.operation;
         match op {
+            Operation::Pin(_) => Ok(()),
             Operation::Delete { .. } => self.check_delete_txn(other_transaction, other_version),
             Operation::Update { .. } => self.check_update_txn(other_transaction, other_version),
             Operation::CreateIndex { .. } => {
@@ -720,6 +733,7 @@ impl<'a> TransactionRebase<'a> {
                 // (deletions take precedence over overlays) and otherwise
                 // preserves physical offsets, so it never conflicts.
                 | Operation::DataOverlay { .. }
+                | Operation::Pin(_)
                 | Operation::UpdateBases { .. } => Ok(()),
                 Operation::Rewrite { groups, .. } => {
                     if groups
@@ -872,6 +886,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::ReserveFragments { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
+                | Operation::Pin(_)
                 | Operation::UpdateBases { .. } => Ok(()),
                 Operation::Project { schema, .. } => {
                     // A project can drop fields, and this update writes
@@ -1087,6 +1102,7 @@ impl<'a> TransactionRebase<'a> {
                 // the index; the query path excludes its covered cells via the
                 // version gate, so the build does not conflict.
                 | Operation::DataOverlay { .. }
+                | Operation::Pin(_)
                 | Operation::UpdateBases { .. } => Ok(()),
                 Operation::CreateIndex {
                     new_indices: created_indices,
@@ -1564,6 +1580,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
                 | Operation::UpdateMemWalState { .. }
+                | Operation::Pin(_)
                 | Operation::UpdateBases { .. } => Ok(()),
                 Operation::Delete {
                     updated_fragments,
@@ -1892,6 +1909,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::ReserveFragments { .. }
             | Operation::Update { .. }
             | Operation::Project { .. }
+            | Operation::Pin(_)
             | Operation::UpdateBases { .. } => Ok(()),
             // An unrecognized operation may touch anything: assume it conflicts.
             Operation::Unknown { .. } => {
@@ -1920,6 +1938,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Update { .. }
             | Operation::ReserveFragments { .. }
             | Operation::Project { .. }
+            | Operation::Pin(_)
             | Operation::UpdateBases { .. }
             | Operation::Merge { .. }
             | Operation::UpdateConfig { .. }
@@ -1947,6 +1966,7 @@ impl<'a> TransactionRebase<'a> {
                 // Both a column replacement and an overlay preserve physical row
                 // addresses; the overlay is newer and wins its covered cells.
                 | Operation::DataOverlay { .. }
+                | Operation::Pin(_)
                 | Operation::UpdateBases { .. } => Ok(()),
                 Operation::Project { schema, .. } => {
                     // A project operation can drop fields.  If the project
@@ -2126,6 +2146,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::CreateIndex { .. }
             | Operation::ReserveFragments { .. }
             | Operation::UpdateConfig { .. }
+            | Operation::Pin(_)
             | Operation::UpdateBases { .. }
             | Operation::Clone { .. }
             | Operation::DataReplacement { .. }
@@ -2256,6 +2277,7 @@ impl<'a> TransactionRebase<'a> {
             Operation::ReserveFragments { .. }
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. }
+            | Operation::Pin(_)
             | Operation::UpdateBases { .. } => Ok(()),
 
             Operation::Update { .. }
@@ -2296,6 +2318,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Merge { .. }
             | Operation::Restore { .. }
             | Operation::ReserveFragments { .. }
+            | Operation::Pin(_)
             | Operation::UpdateBases { .. }
             | Operation::Update { .. }
             | Operation::Project { .. }
@@ -2333,6 +2356,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. }
+            | Operation::Pin(_)
             | Operation::UpdateBases { .. } => Ok(()),
             // An unrecognized operation may touch anything: assume it conflicts.
             Operation::Unknown { .. } => {
@@ -2358,6 +2382,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Rewrite { .. }
             | Operation::Clone { .. }
             | Operation::ReserveFragments { .. }
+            | Operation::Pin(_)
             | Operation::UpdateBases { .. } => Ok(()),
             Operation::Merge { .. } | Operation::Project { .. } => {
                 // Need to recompute the schema
@@ -2430,6 +2455,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Update { .. }
                 | Operation::Project { .. }
                 | Operation::UpdateMemWalState { .. }
+                | Operation::Pin(_)
                 | Operation::UpdateBases { .. } => Ok(()),
                 // An unrecognized operation may touch anything: assume it conflicts.
                 Operation::Unknown { .. } => {
@@ -2499,6 +2525,7 @@ impl<'a> TransactionRebase<'a> {
                 Operation::UpdateConfig { .. }
                 | Operation::Rewrite { .. }
                 | Operation::ReserveFragments { .. }
+                | Operation::Pin(_)
                 | Operation::UpdateBases { .. } => Ok(()),
                 Operation::Append { .. }
                 | Operation::Overwrite { .. }
@@ -2631,6 +2658,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. }
+            | Operation::Pin(_)
             | Operation::UpdateBases { .. } => Ok(self.transaction),
             Operation::Unknown { .. } => Err(Error::not_supported(format!(
                 "Transaction {} has an operation written by a newer version of Lance \
@@ -6536,6 +6564,7 @@ mod tests {
             | Operation::ReserveFragments { .. }
             | Operation::Project { .. }
             | Operation::UpdateConfig { .. }
+            | Operation::Pin(_)
             | Operation::UpdateBases { .. }
             | Operation::Restore { .. }
             | Operation::UpdateMemWalState { .. } => Box::new(std::iter::empty()),

@@ -611,6 +611,31 @@ impl Branches<'_> {
             });
         }
 
+        let location = self.refs.base_location.find_branch(Some(branch))?;
+        match self
+            .refs
+            .commit_handler
+            .resolve_current_location(&location.path, &self.refs.object_store)
+            .await
+        {
+            Ok(head) => {
+                let manifest = lance_table::io::manifest::read_manifest(
+                    &self.refs.object_store,
+                    &head.path,
+                    head.size,
+                )
+                .await?;
+                lance_table::feature_flags::ensure_can_write_manifest(&manifest)?;
+                manifest.validate_ongoing_work_pins()?;
+                if !manifest.ongoing_work_pins.is_empty() {
+                    return Err(Error::RefConflict {
+                        message: format!("Branch {branch} has active ongoing-work pins"),
+                    });
+                }
+            }
+            Err(error) if force && error.is_not_found() => {}
+            Err(error) => return Err(error),
+        }
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch);
         if self.object_store().exists(&branch_file).await? {

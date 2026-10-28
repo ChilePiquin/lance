@@ -903,6 +903,19 @@ pub trait CommitHandler: Debug + Send + Sync {
         true
     }
 
+    /// Resolve the authoritative attached head without a potentially stale version hint.
+    /// External commit stores must override this using their own publication protocol.
+    async fn resolve_current_location(
+        &self,
+        base_path: &Path,
+        object_store: &ObjectStore,
+    ) -> Result<ManifestLocation> {
+        let _ = (base_path, object_store);
+        Err(Error::not_supported(
+            "commit handler does not implement authoritative ongoing-work pin resolution",
+        ))
+    }
+
     async fn resolve_latest_location(
         &self,
         base_path: &Path,
@@ -1574,6 +1587,13 @@ pub struct RenameCommitHandler;
 
 #[async_trait::async_trait]
 impl CommitHandler for RenameCommitHandler {
+    async fn resolve_current_location(
+        &self,
+        base_path: &Path,
+        object_store: &ObjectStore,
+    ) -> Result<ManifestLocation> {
+        resolve_version_from_listing(object_store, base_path).await
+    }
     fn is_version_not_found_definitive(&self) -> bool {
         true
     }
@@ -1642,6 +1662,13 @@ pub struct ConditionalPutCommitHandler;
 
 #[async_trait::async_trait]
 impl CommitHandler for ConditionalPutCommitHandler {
+    async fn resolve_current_location(
+        &self,
+        base_path: &Path,
+        object_store: &ObjectStore,
+    ) -> Result<ManifestLocation> {
+        resolve_version_from_listing(object_store, base_path).await
+    }
     fn is_version_not_found_definitive(&self) -> bool {
         true
     }
@@ -1722,6 +1749,13 @@ struct TencentCosCommitHandler;
 
 #[async_trait::async_trait]
 impl CommitHandler for TencentCosCommitHandler {
+    async fn resolve_current_location(
+        &self,
+        base_path: &Path,
+        object_store: &ObjectStore,
+    ) -> Result<ManifestLocation> {
+        resolve_version_from_listing(object_store, base_path).await
+    }
     fn is_version_not_found_definitive(&self) -> bool {
         true
     }

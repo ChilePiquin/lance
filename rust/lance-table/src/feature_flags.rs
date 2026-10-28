@@ -127,7 +127,7 @@ pub const FLAG_ZONE_WRITE_SEEDS: u64 = 1 << 16;
 /// covered features share this one bit.
 pub const FLAG_OBJECT_METADATA: u64 = 1 << 17;
 /// Writer-only retention requirements for ongoing work pins in the current manifest.
-/// Reserved and unsupported until pin-aware writes and maintenance are implemented.
+/// Maintenance preserves active pins until a committed release or expiration.
 /// Ordinary reads do not require support for the pin metadata.
 pub const FLAG_ONGOING_WORK_PINS: u64 = 1 << 19;
 /// The first bit that is unknown as a feature flag
@@ -157,7 +157,8 @@ pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS
     | FLAG_MANAGED_BLOBS
     | FLAG_ZONE_WRITE_SEEDS;
 pub(crate) const STICKY_READER_FLAGS: u64 = STICKY_PAIRED_FLAGS;
-pub(crate) const STICKY_WRITER_FLAGS: u64 = STICKY_PAIRED_FLAGS | FLAG_NON_REUSABLE_FIELD_IDS;
+pub(crate) const STICKY_WRITER_FLAGS: u64 =
+    STICKY_PAIRED_FLAGS | FLAG_NON_REUSABLE_FIELD_IDS | FLAG_ONGOING_WORK_PINS;
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
@@ -179,6 +180,7 @@ pub fn apply_feature_flags(
         & FLAG_COVERED_INDEX_METADATA;
     // Same carry for the index section's clustering references and generic
     // metadata, which `build_manifest` derives from the index list.
+    let pin_flags = manifest.writer_feature_flags & FLAG_ONGOING_WORK_PINS;
     let object_metadata = manifest.writer_feature_flags & FLAG_OBJECT_METADATA;
     let sticky_paired_flags = validated_sticky_paired_flags(manifest)?;
     let non_reusable_field_ids = manifest.max_allocated_field_id.is_some();
@@ -188,7 +190,7 @@ pub fn apply_feature_flags(
     validate_non_reusable_field_id_flags(manifest)?;
     // Reset flags
     manifest.reader_feature_flags = 0;
-    manifest.writer_feature_flags = 0;
+    manifest.writer_feature_flags = pin_flags;
 
     let has_deletion_files = manifest
         .fragments
@@ -391,7 +393,7 @@ fn supported_flags_when(
     mark_supported(&mut supported, FLAG_OBJECT_METADATA, true);
     // Bit 18 is left for separate format proposals and has no supported feature here.
     mark_supported(&mut supported, 1 << 18, false);
-    mark_supported(&mut supported, FLAG_ONGOING_WORK_PINS, false);
+    mark_supported(&mut supported, FLAG_ONGOING_WORK_PINS, true);
     supported
 }
 
@@ -584,7 +586,6 @@ mod tests {
 
     #[rstest::rstest]
     #[case::unassigned_bit_18(1 << 18, 18)]
-    #[case::ongoing_work_pins(FLAG_ONGOING_WORK_PINS, 19)]
     fn test_reserved_writer_flag_fences_writes_without_blocking_reads(
         #[case] flag: u64,
         #[case] bit: u32,

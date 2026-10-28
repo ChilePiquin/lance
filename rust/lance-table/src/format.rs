@@ -9,6 +9,8 @@ mod fragment;
 mod index;
 pub mod key_existence;
 mod manifest;
+mod ongoing_work;
+pub use ongoing_work::{OngoingWorkPin, PinTime};
 pub mod overlay;
 mod row_ids;
 mod transaction;

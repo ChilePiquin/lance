@@ -446,6 +446,21 @@ pub trait DatasetIndexExt {
         segments: Vec<impl IntoIndexSegment + Send>,
     ) -> Result<()>;
 
+    /// Publish staged segments only while the build's ongoing-work pin is active.
+    /// The check is repeated at the final manifest commit target, fencing revoked builds.
+    /// Release the pin after successful publication, never before.
+    async fn commit_existing_index_segments_with_pin(
+        &mut self,
+        _index_name: &str,
+        _column: &str,
+        _segments: Vec<impl IntoIndexSegment + Send>,
+        _pin_id: &str,
+    ) -> Result<()> {
+        Err(lance_core::Error::not_supported(
+            "protected index publication is not implemented",
+        ))
+    }
+
     async fn read_index_partition(
         &self,
         index_name: &str,

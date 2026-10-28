@@ -706,6 +706,13 @@ impl ExternalManifestCommitHandler {
 
 #[async_trait]
 impl CommitHandler for ExternalManifestCommitHandler {
+    async fn resolve_current_location(
+        &self,
+        base_path: &Path,
+        object_store: &ObjectStore,
+    ) -> Result<ManifestLocation> {
+        self.resolve_latest_location(base_path, object_store).await
+    }
     async fn version_exists(
         &self,
         base_path: &Path,
