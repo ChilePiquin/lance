@@ -202,6 +202,25 @@ trimmed. Cleanup must retain intermediate transitions still needed to translate
 old addresses. External mapping files can be deleted only when no retained
 dataset version references them.
 
+### Ongoing work retention
+
+[Ongoing-work pins](../../table/ongoing_work_pins.md) are additional history
+consumers before their jobs publish an index. A current active pin at source
+version V retains the applicable current-chain transitions stamped at or after
+V, inclusively; a rewrite stamps its transition with the immediately preceding
+dataset version. Retain the union of requirements from all pins and existing
+consumers. Validate that union at the final commit target of every operation
+that trims or replaces history, including work planned before registration.
+
+Compaction must record the movements active pins need and recheck those pins
+before committing. Reject a result lacking required mappings so the caller can
+replan. Restore or
+Overwrite can discard a translation path while continuing to retain the source
+snapshot. A pin does not require mappings solely into a discarded intermediate
+layout, establish index freshness, or authorize publication of an old result.
+Referenced external mapping files remain subject to ordinary retained-snapshot
+protection and its [maintenance concurrency limits](../../table/ongoing_work_pins.md#maintenance-concurrency-limits).
+
 ## Stable Row IDs
 
 Older readers and writers did not expect both stable row IDs and a Fragment Reuse Index but are
