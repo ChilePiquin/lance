@@ -466,7 +466,7 @@ impl BlockingDataset {
             builder = builder.with_commit_handler(handler);
         }
         let new_dataset = block_on(builder.execute(transaction))?;
-        Ok(BlockingDataset { inner: new_dataset })
+        Ok(Self { inner: new_dataset })
     }
 
     pub fn read_transaction(&self) -> Result<Option<Transaction>> {
@@ -1807,7 +1807,7 @@ fn get_native_namespace_handle(env: &mut JNIEnv, namespace_obj: &JObject) -> Res
 /// Returns `None` if `namespace_obj` is null, otherwise returns the namespace
 /// and table_id pair.
 #[allow(clippy::type_complexity)]
-pub(crate) fn extract_namespace_info(
+pub fn extract_namespace_info(
     env: &mut JNIEnv,
     namespace_obj: &JObject,
     table_id_obj: &JObject,

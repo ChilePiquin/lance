@@ -41,17 +41,19 @@ pub fn convert_to_java_field<'local>(
     let metadata = to_java_map(env, &lance_field.metadata)?;
     let logical_type = env.new_string(lance_field.logical_type.to_string())?;
     let arrow_type = convert_arrow_type(env, &lance_field.data_type())?;
-    let ctor_sig = "(IILjava/lang/String;".to_owned()
-        + "ZLjava/lang/String;"
-        + "Lorg/apache/arrow/vector/types/pojo/ArrowType;"
-        + "Lorg/apache/arrow/vector/types/pojo/DictionaryEncoding;"
-        + "Ljava/util/Map;"
-        + "Ljava/util/List;ZIZI)V";
+    let ctor_sig = concat!(
+        "(IILjava/lang/String;",
+        "ZLjava/lang/String;",
+        "Lorg/apache/arrow/vector/types/pojo/ArrowType;",
+        "Lorg/apache/arrow/vector/types/pojo/DictionaryEncoding;",
+        "Ljava/util/Map;",
+        "Ljava/util/List;ZIZI)V",
+    );
     let pk_position = lance_field.unenforced_primary_key_position.unwrap_or(0) as jint;
     let ck_position = lance_field.unenforced_clustering_key_position.unwrap_or(0) as jint;
     let field_obj = env.new_object(
         "org/lance/schema/LanceField",
-        ctor_sig.as_str(),
+        ctor_sig,
         &[
             JValue::Int(lance_field.id as jint),
             JValue::Int(lance_field.parent_id as jint),

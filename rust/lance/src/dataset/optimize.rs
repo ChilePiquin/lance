@@ -9115,6 +9115,16 @@ mod tests {
 
     #[async_trait]
     impl CommitHandler for RaceBeforeRewrite {
+        async fn resolve_current_location(
+            &self,
+            base_path: &object_store::path::Path,
+            object_store: &ObjectStore,
+        ) -> Result<ManifestLocation> {
+            ConditionalPutCommitHandler
+                .resolve_current_location(base_path, object_store)
+                .await
+        }
+
         async fn commit(
             &self,
             manifest: &mut Manifest,

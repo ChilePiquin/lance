@@ -43,13 +43,13 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
-pub(crate) struct FragmentMergeResult {
+pub struct FragmentMergeResult {
     fragment: Fragment,
     schema: Schema,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct FragmentUpdateResult {
+pub struct FragmentUpdateResult {
     updated_fragment: Fragment,
     fields_modified: Vec<u32>,
     /// Matched row offsets serialized as portable RoaringBitmap bytes.
@@ -1040,7 +1040,7 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
 
 /// Read a nullable `java.lang.Long` clustering id and check it fits the
 /// unsigned 32-bit id range of the format.
-pub(crate) fn extract_clustering_id(
+pub fn extract_clustering_id(
     env: &mut JNIEnv<'_>,
     obj: &JObject<'_>,
     method: &str,
@@ -1060,7 +1060,7 @@ pub(crate) fn extract_clustering_id(
 }
 
 /// Read a non-null `java.util.Map<String, String>` of generic object metadata.
-pub(crate) fn extract_metadata_map(
+pub fn extract_metadata_map(
     env: &mut JNIEnv<'_>,
     obj: &JObject<'_>,
     method: &str,

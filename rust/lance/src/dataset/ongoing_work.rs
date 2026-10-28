@@ -14,35 +14,40 @@ use std::sync::Arc;
 
 impl Dataset {
     /// Resolve current membership without a version hint or a historical cache hit.
-    pub(crate) async fn current_for_ongoing_work(&self) -> Result<Self> {
-        if is_detached_version(self.manifest.version) {
-            return Err(Error::invalid_input(
-                "detached snapshots cannot own ongoing-work pins",
-            ));
+    pub(crate) fn current_for_ongoing_work(&self) -> BoxFuture<'_, Result<Self>> {
+        // Cleanup also runs on the write path; keep uncached manifest resolution
+        // out of every caller's inline async state.
+        async move {
+            if is_detached_version(self.manifest.version) {
+                return Err(Error::invalid_input(
+                    "detached snapshots cannot own ongoing-work pins",
+                ));
+            }
+            let location = self
+                .commit_handler
+                .resolve_current_location(&self.base, &self.object_store)
+                .await?;
+            let manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
+            if manifest.branch != self.manifest.branch {
+                return Err(Error::invalid_input(
+                    "ongoing-work pin resolved a different branch",
+                ));
+            }
+            manifest.validate_ongoing_work_pins()?;
+            Self::checkout_manifest(
+                self.object_store.clone(),
+                self.base.clone(),
+                self.uri.clone(),
+                Arc::new(manifest),
+                location,
+                self.session(),
+                self.commit_handler.clone(),
+                self.file_reader_options.clone(),
+                self.store_params.as_deref().cloned(),
+                self.base_store_params.clone(),
+            )
         }
-        let location = self
-            .commit_handler
-            .resolve_current_location(&self.base, &self.object_store)
-            .await?;
-        let manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
-        if manifest.branch != self.manifest.branch {
-            return Err(Error::invalid_input(
-                "ongoing-work pin resolved a different branch",
-            ));
-        }
-        manifest.validate_ongoing_work_pins()?;
-        Self::checkout_manifest(
-            self.object_store.clone(),
-            self.base.clone(),
-            self.uri.clone(),
-            Arc::new(manifest),
-            location,
-            self.session(),
-            self.commit_handler.clone(),
-            self.file_reader_options.clone(),
-            self.store_params.as_deref().cloned(),
-            self.base_store_params.clone(),
-        )
+        .boxed()
     }
 
     /// Identify this snapshot independently of the version-keyed transaction cache.

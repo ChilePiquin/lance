@@ -94,8 +94,8 @@ impl BlockingScanner {
 ///////////////////
 
 /// Build FTS query from Java FullTextQuery object
-/// Made pub(crate) to be reused by async_scanner
-pub(crate) fn build_full_text_search_query<'a>(
+/// Shared with async_scanner.
+pub fn build_full_text_search_query<'a>(
     env: &mut JNIEnv<'a>,
     java_obj: JObject,
 ) -> Result<FtsQuery> {
@@ -283,7 +283,7 @@ fn get_document_granularity(
 }
 
 /// Scanner options passed from JNI - shared between blocking and async scanners
-pub(crate) struct ScannerOptions<'a> {
+pub struct ScannerOptions<'a> {
     pub fragment_ids_obj: JObject<'a>,
     pub fragment_slices_obj: JObject<'a>,
     pub index_segments_obj: JObject<'a>,
@@ -349,7 +349,7 @@ fn parse_fragment_slices(
 }
 
 /// Build a scanner with options applied - shared by blocking and async scanners
-pub(crate) fn build_scanner_with_options<'a>(
+pub fn build_scanner_with_options<'a>(
     env: &mut JNIEnv<'a>,
     dataset: &lance::Dataset,
     options: ScannerOptions<'a>,

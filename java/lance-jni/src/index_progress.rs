@@ -11,7 +11,7 @@ use lance_index::progress::IndexBuildProgress;
 use crate::error::{Error, Result};
 
 /// Bridges Rust index progress events to a Java callback.
-pub(crate) struct JavaIndexBuildProgress {
+pub struct JavaIndexBuildProgress {
     callback: GlobalRef,
     jvm: Arc<JavaVM>,
 }

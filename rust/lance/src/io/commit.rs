@@ -1734,469 +1734,473 @@ pub(crate) async fn commit_transaction(
     manifest_naming_scheme: ManifestNamingScheme,
     affected_rows: Option<&RowAddrTreeMap>,
 ) -> Result<(Manifest, ManifestLocation)> {
-    // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
-    // has not necessarily. So for anything involving writing, use `object_store`.
-    let read_version = transaction.read_version;
-    let mut target_version = read_version + 1;
-    let original_dataset = dataset.clone();
+    // Keep retry state and retained manifests off every writer's inline future.
+    Box::pin(async move {
+        // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
+        // has not necessarily. So for anything involving writing, use `object_store`.
+        let read_version = transaction.read_version;
+        let mut target_version = read_version + 1;
+        let original_dataset = dataset.clone();
 
-    // read_version sometimes defaults to zero for overwrite.
-    // If num_retries is zero, we are in "strict overwrite" mode.
-    // Strict overwrites are not subject to any sort of automatic conflict resolution.
-    let strict_overwrite = matches!(transaction.operation, Operation::Overwrite { .. })
-        && commit_config.num_retries == 0;
-    let mut dataset = if matches!(transaction.operation, Operation::Pin(_)) {
-        dataset.current_for_ongoing_work().await?
-    } else if dataset.manifest.version != read_version && (read_version != 0 || strict_overwrite) {
-        // If the dataset version is not the same as the read version, we need to
-        // checkout the read version.
-        dataset.checkout_version(read_version).await?
-    } else {
-        // If the dataset version is the same as the read version, we can use it directly.
-        dataset.clone()
-    };
-
-    // The version this transaction read, captured before the retry loop moves
-    // `dataset` forward. MemWAL index catch-up is derived from it: an index
-    // covering every fragment live here holds every row compaction had copied
-    // in by then.
-    //
-    // The Arc is kept rather than cloned out: `load_all_indices` returns shared
-    // cached data, so the common case is a cache hit rather than a read.
-    let read_version_dataset = dataset.clone();
-    let read_version_indices = load_all_indices(&read_version_dataset).await?;
-    let read_version_state = Some(crate::dataset::transaction::ReadVersionState {
-        manifest: read_version_dataset.manifest.as_ref(),
-        indices: read_version_indices.as_slice(),
-    });
-
-    let mut transaction = transaction.clone();
-    // What a rewrite on a tagged fragment reuse history assembled for the
-    // attempt; handed to the manifest build, never written back into
-    // `transaction`.
-    let mut tagged_rewrite = None;
-
-    let num_attempts = std::cmp::max(commit_config.num_retries, 1);
-    let mut backoff = SlotBackoff::default();
-    // `retry_timeout` bounds the conflict-retry phase, which starts once the
-    // first attempt has caught up with the versions committed since
-    // `read_version`. A long-running writer (index build, compaction) on a
-    // write-heavy table can be thousands of versions behind, and that initial
-    // catch-up is work the commit must do however many retries it gets.
-    let mut retry_start: Option<Instant> = None;
-
-    // Other transactions that may have been committed since the read_version.
-    // We keep pair of (version, transaction). No other transactions to check initially
-    let mut other_transactions: Vec<(u64, Arc<Transaction>)>;
-    // Track the transaction file written in the current loop iteration so we can
-    // delete it if the commit ultimately fails.
-    let mut current_transaction_file = String::new();
-
-    // An allocating clustering submission from a reusable-id snapshot: judge
-    // every transaction in its window for field-identity changes; see
-    // `refuse_field_identity_change`. Decided from the version the transaction
-    // read, not from the handle it was submitted through, which may already
-    // be at a later, activated version.
-    let identity_fence = (!read_version_dataset.manifest.uses_non_reusable_field_ids()
-        && write_config.allocates_clustering_definitions(&read_version_dataset.manifest))
-    .then(|| read_version_dataset.schema().clone());
-
-    while backoff.attempt() < num_attempts {
-        // We are pessimistic here and assume there may be other transactions
-        // we need to check for. We could be optimistic here and blindly
-        // attempt to commit, giving faster performance for sequence writes and
-        // slower performance for concurrent writes. But that makes the fast path
-        // faster and the slow path slower, which makes performance less predictable
-        // for users. So we always check for other transactions.
-        // We skip this for strict overwrites, because strict overwrites can't be rebased.
-        if let Operation::Pin(operation) = &transaction.operation {
-            dataset = Box::pin(dataset.current_for_ongoing_work()).await?;
-            ensure_can_write_manifest(&dataset.manifest)?;
-            if let lance_table::transaction::PinOperation::Register {
-                source_transaction_uuid,
-                ..
-            } = operation
-                && !dataset
-                    .manifest
-                    .ongoing_work_pins
-                    .iter()
-                    .any(|p| p.id == transaction.uuid)
-                && (dataset.manifest.version != transaction.read_version
-                    || dataset.ongoing_work_source_id().await? != *source_transaction_uuid)
-            {
-                return Err(Error::commit_conflict_source(
-                    dataset.manifest.version,
-                    "pin registration source is no longer current".into(),
-                ));
-            }
-            let mut state = dataset.manifest.as_ref().clone();
-            if !operation.apply(&transaction, &mut state)? {
-                return Ok((
-                    dataset.manifest.as_ref().clone(),
-                    dataset.manifest_location.clone(),
-                ));
-            }
-        } else if !strict_overwrite {
-            let checked_since = dataset.manifest.version;
-            (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;
-
-            ensure_can_write_manifest(&dataset.manifest)?;
-
-            // See if we can retry the commit. Try to account for all
-            // transactions that have been committed since the read_version.
-            // Use small amount of backoff to handle transactions that all
-            // started at exact same time better.
-
-            let mut rebase =
-                TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
-            rebase.load_current_lineage(&dataset).await?;
-            let seen = other_transactions
-                .iter()
-                .map(|(version, _)| *version)
-                .collect::<HashSet<_>>();
-            let missing = (checked_since + 1..=dataset.manifest.version)
-                .filter(|version| !seen.contains(version))
-                .collect::<Vec<_>>();
-            if rebase.needs_versions(&missing) {
-                return Err(Error::retryable_commit_conflict_source(
-                    dataset.manifest.version,
-                    format!(
-                        "versions {missing:?} were cleaned up, so this index cannot be carried \
-                         through the deferred compaction it covers; rebuild it"
-                    )
-                    .into(),
-                ));
-            }
-            // A cleaned-up version may have replaced a key field; an identity
-            // window with a hole cannot be judged, so it is refused.
-            if identity_fence.is_some() && !missing.is_empty() {
-                return Err(Error::commit_conflict_source(
-                    dataset.manifest.version,
-                    format!(
-                        "versions {missing:?} between this submission's read version and the \
-                         latest were cleaned up, so the field identity of its clustering keys \
-                         cannot be checked; reload the table and rebuild the list"
-                    )
-                    .into(),
-                ));
-            }
-
-            for (other_version, other_transaction) in other_transactions.iter() {
-                if let Some(read_schema) = &identity_fence {
-                    conflict_resolver::refuse_field_identity_change(
-                        read_schema,
-                        other_transaction,
-                        *other_version,
-                    )?;
-                }
-                rebase.check_txn(other_transaction, *other_version)?;
-            }
-
-            let (rebased, assembly) = rebase.finish_with_tagged_rewrite(&dataset).await?;
-            transaction = rebased;
-            tagged_rewrite = assembly;
+        // read_version sometimes defaults to zero for overwrite.
+        // If num_retries is zero, we are in "strict overwrite" mode.
+        // Strict overwrites are not subject to any sort of automatic conflict resolution.
+        let strict_overwrite = matches!(transaction.operation, Operation::Overwrite { .. })
+            && commit_config.num_retries == 0;
+        let mut dataset = if matches!(transaction.operation, Operation::Pin(_)) {
+            dataset.current_for_ongoing_work().await?
+        } else if dataset.manifest.version != read_version && (read_version != 0 || strict_overwrite) {
+            // If the dataset version is not the same as the read version, we need to
+            // checkout the read version.
+            dataset.checkout_version(read_version).await?
         } else {
-            ensure_can_write_manifest(&dataset.manifest)?;
-        }
-        if dataset.manifest.writer_feature_flags
-            & lance_table::feature_flags::FLAG_ONGOING_WORK_PINS
-            != 0
-        {
-            let current = Box::pin(dataset.current_for_ongoing_work()).await?;
-            if current.manifest.version != dataset.manifest.version
-                || current.ongoing_work_source_id().await?
-                    != dataset.ongoing_work_source_id().await?
-            {
-                return Err(Error::retryable_commit_conflict_source(
-                    current.manifest.version,
-                    "ongoing-work state advanced beyond commit replay; reload and retry".into(),
-                ));
-            }
-        }
-        let attempt_start = Instant::now();
-        let retry_start = *retry_start.get_or_insert(attempt_start);
-
-        // Merge preserves fields from the read version; Overwrite replaces all
-        // fields. Allocate new IDs above the latest high-water mark.
-        // Each attempt remaps its own copy of the
-        // staged files, so a retry never mistakes a provisional ID for a field
-        // introduced by a concurrent commit.
-        // Keep the per-attempt copy out of the commit future's inline state.
-        let mut attempt_transaction = Box::new(transaction.clone());
-        canonicalize_non_reusable_field_ids(
-            Some(&dataset.manifest),
-            &mut attempt_transaction.operation,
-            Some(read_version_dataset.schema()),
-        )?;
-        validate_operation(Some(&dataset.manifest), &attempt_transaction.operation)?;
-
-        // Recomputed every attempt: the rebase above may have rewritten the
-        // transaction.
-        let pb_transaction = pb::Transaction::try_from(attempt_transaction.as_ref())?;
-        let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
-        // Classified from the operation itself. Reading it back off the inline
-        // copy would tie the verdict to the payload size instead.
-        let may_change_schema = operation_may_change_schema(&pb_transaction);
-
-        current_transaction_file = if !write_config.disable_transaction_file() {
-            write_transaction_file(object_store, &dataset.base, &pb_transaction).await?
-        } else {
-            String::new()
-        };
-        let transaction_file = current_transaction_file.as_str();
-
-        target_version = dataset.manifest.version + 1;
-        if is_detached_version(target_version) {
-            return Err(Error::internal(
-                "more than 2^65 versions have been created and so regular version numbers are appearing as 'detached' versions.",
-            ));
-        }
-        // Build an up-to-date manifest from the transaction and current
-        // manifest: prepare the index list against this attempt's manifest
-        // first, then build from the prepared result.
-        let build_config =
-            build_config_for_attempt(&dataset, &attempt_transaction, write_config).await?;
-        let (mut manifest, mut indices) = match attempt_transaction.operation {
-            Operation::Restore { version } => {
-                // A restore reinstates its snapshot's index list and entry
-                // whole; nothing is prepared or withdrawn a second time.
-                Transaction::restore_old_manifest(
-                    object_store,
-                    commit_handler,
-                    &dataset.base,
-                    version,
-                    &build_config,
-                    transaction_file,
-                    &dataset.manifest,
-                )
-                .await?
-            }
-            _ => {
-                let frag_reuse = match tagged_rewrite.take() {
-                    Some(assembly) => FragReuseUpdate::Rewrite(assembly),
-                    None if write_config.tagged_frag_reuse_trim() => FragReuseUpdate::Trim,
-                    None => FragReuseUpdate::None,
-                };
-                let prepared =
-                    prepare_attempt(&dataset, &attempt_transaction, &build_config, frag_reuse)
-                        .await?;
-                let (mut manifest, indices) = attempt_transaction.build_manifest_prepared(
-                    Some(dataset.manifest.as_ref()),
-                    prepared,
-                    transaction_file,
-                    &build_config,
-                    read_version_state,
-                )?;
-                crate::dataset::write::seeds::apply_seed_feature_flags(
-                    &mut manifest,
-                    &indices,
-                    &dataset,
-                )
-                .await?;
-                (manifest, indices)
-            }
+            // If the dataset version is the same as the read version, we can use it directly.
+            dataset.clone()
         };
 
-        manifest.version = target_version;
+        // The version this transaction read, captured before the retry loop moves
+        // `dataset` forward. MemWAL index catch-up is derived from it: an index
+        // covering every fragment live here holds every row compaction had copied
+        // in by then.
+        //
+        // The Arc is kept rather than cloned out: `load_all_indices` returns shared
+        // cached data, so the common case is a cache hit rather than a read.
+        let read_version_dataset = dataset.clone();
+        let read_version_indices = load_all_indices(&read_version_dataset).await?;
+        let read_version_state = Some(crate::dataset::transaction::ReadVersionState {
+            manifest: read_version_dataset.manifest.as_ref(),
+            indices: read_version_indices.as_slice(),
+        });
 
-        let previous_writer_version = &dataset.manifest.writer_version;
-        // The versions of Lance prior to when we started writing the writer version
-        // sometimes wrote incorrect `Fragment.physical_rows` values, so we should
-        // make sure to recompute them.
-        // See: https://github.com/lance-format/lance/issues/1531
-        let recompute_stats = previous_writer_version.is_none();
+        let mut transaction = transaction.clone();
+        // What a rewrite on a tagged fragment reuse history assembled for the
+        // attempt; handed to the manifest build, never written back into
+        // `transaction`.
+        let mut tagged_rewrite = None;
 
-        migrate_manifest(&dataset, &mut manifest, recompute_stats).await?;
+        let num_attempts = std::cmp::max(commit_config.num_retries, 1);
+        let mut backoff = SlotBackoff::default();
+        // `retry_timeout` bounds the conflict-retry phase, which starts once the
+        // first attempt has caught up with the versions committed since
+        // `read_version`. A long-running writer (index build, compaction) on a
+        // write-heavy table can be thousands of versions behind, and that initial
+        // catch-up is work the commit must do however many retries it gets.
+        let mut retry_start: Option<Instant> = None;
 
-        fix_schema(&mut manifest)?;
-        validate_non_reusable_field_id_transition(
-            &dataset.manifest,
-            &manifest,
-            &attempt_transaction.operation,
-        )?;
+        // Other transactions that may have been committed since the read_version.
+        // We keep pair of (version, transaction). No other transactions to check initially
+        let mut other_transactions: Vec<(u64, Arc<Transaction>)>;
+        // Track the transaction file written in the current loop iteration so we can
+        // delete it if the commit ultimately fails.
+        let mut current_transaction_file = String::new();
 
-        crate::dataset::versions::check_manifest_storage_version_for_commit(&mut manifest)?;
-        check_fragment_ids(&manifest)?;
+        // An allocating clustering submission from a reusable-id snapshot: judge
+        // every transaction in its window for field-identity changes; see
+        // `refuse_field_identity_change`. Decided from the version the transaction
+        // read, not from the handle it was submitted through, which may already
+        // be at a later, activated version.
+        let identity_fence = (!read_version_dataset.manifest.uses_non_reusable_field_ids()
+            && write_config.allocates_clustering_definitions(&read_version_dataset.manifest))
+        .then(|| read_version_dataset.schema().clone());
 
-        // Runs after the coverage derivation and can replace a fragment bitmap
-        // while keeping its UUID, so anything it narrowed loses its position.
-        let recovered_coverage = migrate_indices(&dataset, &mut indices).await?;
-        Transaction::withdraw_coverage_invalidated_after_build(
-            &mut indices,
-            &recovered_coverage,
-            target_version,
-        )?;
-
-        // Try to commit the manifest
-        let result = write_manifest_file(
-            object_store,
-            commit_handler,
-            &dataset.base,
-            &mut manifest,
-            if indices.is_empty() {
-                None
-            } else {
-                Some(indices.clone())
-            },
-            write_config,
-            manifest_naming_scheme,
-            inline_transaction.then(|| pb_transaction.into()),
-            may_change_schema,
-        )
-        .await;
-
-        match result {
-            Ok(manifest_location) => {
-                record_successful_commit(
-                    &dataset,
-                    &attempt_transaction,
-                    &manifest,
-                    &manifest_location,
-                    indices,
-                    commit_config.skip_auto_cleanup,
-                )
-                .await;
-                return Ok((manifest, manifest_location));
-            }
-            Err(CommitError::CommitConflict) => {
-                // The store may have applied this attempt's write and still
-                // reported a conflict (e.g. the response to a successful
-                // conditional PUT was lost and an internal retry saw
-                // "already exists"). Verify who owns the version before
-                // treating the attempt as lost: deleting the artifacts of a
-                // commit that actually landed corrupts the version.
-                match verify_commit_outcome(
-                    object_store,
-                    commit_handler,
-                    &dataset.base,
-                    target_version,
-                    &attempt_transaction,
-                )
-                .await
+        while backoff.attempt() < num_attempts {
+            // We are pessimistic here and assume there may be other transactions
+            // we need to check for. We could be optimistic here and blindly
+            // attempt to commit, giving faster performance for sequence writes and
+            // slower performance for concurrent writes. But that makes the fast path
+            // faster and the slow path slower, which makes performance less predictable
+            // for users. So we always check for other transactions.
+            // We skip this for strict overwrites, because strict overwrites can't be rebased.
+            if let Operation::Pin(operation) = &transaction.operation {
+                dataset = dataset.current_for_ongoing_work().await?;
+                ensure_can_write_manifest(&dataset.manifest)?;
+                if let lance_table::transaction::PinOperation::Register {
+                    source_transaction_uuid,
+                    ..
+                } = operation
+                    && !dataset
+                        .manifest
+                        .ongoing_work_pins
+                        .iter()
+                        .any(|p| p.id == transaction.uuid)
+                    && (dataset.manifest.version != transaction.read_version
+                        || dataset.ongoing_work_source_id().await? != *source_transaction_uuid)
                 {
-                    CommitOutcome::Ours {
-                        manifest: committed_manifest,
-                        location,
-                    } => {
-                        let committed_manifest = *committed_manifest;
-                        record_successful_commit(
-                            &dataset,
-                            &attempt_transaction,
-                            &committed_manifest,
-                            &location,
-                            indices,
-                            commit_config.skip_auto_cleanup,
+                    return Err(Error::commit_conflict_source(
+                        dataset.manifest.version,
+                        "pin registration source is no longer current".into(),
+                    ));
+                }
+                let mut state = dataset.manifest.as_ref().clone();
+                if !operation.apply(&transaction, &mut state)? {
+                    return Ok((
+                        dataset.manifest.as_ref().clone(),
+                        dataset.manifest_location.clone(),
+                    ));
+                }
+            } else if !strict_overwrite {
+                let checked_since = dataset.manifest.version;
+                (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;
+
+                ensure_can_write_manifest(&dataset.manifest)?;
+
+                // See if we can retry the commit. Try to account for all
+                // transactions that have been committed since the read_version.
+                // Use small amount of backoff to handle transactions that all
+                // started at exact same time better.
+
+                let mut rebase =
+                    TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
+                rebase.load_current_lineage(&dataset).await?;
+                let seen = other_transactions
+                    .iter()
+                    .map(|(version, _)| *version)
+                    .collect::<HashSet<_>>();
+                let missing = (checked_since + 1..=dataset.manifest.version)
+                    .filter(|version| !seen.contains(version))
+                    .collect::<Vec<_>>();
+                if rebase.needs_versions(&missing) {
+                    return Err(Error::retryable_commit_conflict_source(
+                        dataset.manifest.version,
+                        format!(
+                            "versions {missing:?} were cleaned up, so this index cannot be carried \
+                             through the deferred compaction it covers; rebuild it"
                         )
-                        .await;
-                        return Ok((committed_manifest, location));
-                    }
-                    // Confirmed loss: another writer owns the version (or,
-                    // for handlers that detect conflicts before writing,
-                    // the attempt never landed). Proceed with the normal
-                    // rebase-and-retry path.
-                    CommitOutcome::Foreign | CommitOutcome::Absent => {}
-                    CommitOutcome::Unknown => {
-                        return Err(Error::commit_status_unknown_source(
-                            target_version,
-                            "commit reported a conflict but the manifest at the target \
-                             version could not be read back for verification"
-                                .to_string()
-                                .into(),
-                        ));
-                    }
+                        .into(),
+                    ));
                 }
-                let next_attempt_i = backoff.attempt() + 1;
-
-                if backoff.attempt() == 0 {
-                    // We add 10% buffer here, to allow concurrent writes to complete.
-                    // We pass the first attempt's time to the backoff so it's used
-                    // as the unit for backoff time slots. The catch-up before the
-                    // attempt is excluded: it is not the window in which concurrent
-                    // writers collide with this one.
-                    // See SlotBackoff implementation for more details on how this works.
-                    backoff =
-                        backoff.with_unit((attempt_start.elapsed().as_millis() * 11 / 10) as u32);
+                // A cleaned-up version may have replaced a key field; an identity
+                // window with a hole cannot be judged, so it is refused.
+                if identity_fence.is_some() && !missing.is_empty() {
+                    return Err(Error::commit_conflict_source(
+                        dataset.manifest.version,
+                        format!(
+                            "versions {missing:?} between this submission's read version and the \
+                             latest were cleaned up, so the field identity of its clustering keys \
+                             cannot be checked; reload the table and rebuild the list"
+                        )
+                        .into(),
+                    ));
                 }
 
-                if next_attempt_i < num_attempts {
-                    // The transaction file from this attempt is now stale; clean it up
-                    // before the next attempt writes a new one (possibly rebased).
-                    cleanup_transaction_file(
+                for (other_version, other_transaction) in other_transactions.iter() {
+                    if let Some(read_schema) = &identity_fence {
+                        conflict_resolver::refuse_field_identity_change(
+                            read_schema,
+                            other_transaction,
+                            *other_version,
+                        )?;
+                    }
+                    rebase.check_txn(other_transaction, *other_version)?;
+                }
+
+                let (rebased, assembly) = rebase.finish_with_tagged_rewrite(&dataset).await?;
+                transaction = rebased;
+                tagged_rewrite = assembly;
+            } else {
+                ensure_can_write_manifest(&dataset.manifest)?;
+            }
+            if dataset.manifest.writer_feature_flags
+                & lance_table::feature_flags::FLAG_ONGOING_WORK_PINS
+                != 0
+            {
+                let current = dataset.current_for_ongoing_work().await?;
+                if current.manifest.version != dataset.manifest.version
+                    || current.ongoing_work_source_id().await?
+                        != dataset.ongoing_work_source_id().await?
+                {
+                    return Err(Error::retryable_commit_conflict_source(
+                        current.manifest.version,
+                        "ongoing-work state advanced beyond commit replay; reload and retry".into(),
+                    ));
+                }
+            }
+            let attempt_start = Instant::now();
+            let retry_start = *retry_start.get_or_insert(attempt_start);
+
+            // Merge preserves fields from the read version; Overwrite replaces all
+            // fields. Allocate new IDs above the latest high-water mark.
+            // Each attempt remaps its own copy of the
+            // staged files, so a retry never mistakes a provisional ID for a field
+            // introduced by a concurrent commit.
+            // Keep the per-attempt copy out of the commit future's inline state.
+            let mut attempt_transaction = Box::new(transaction.clone());
+            canonicalize_non_reusable_field_ids(
+                Some(&dataset.manifest),
+                &mut attempt_transaction.operation,
+                Some(read_version_dataset.schema()),
+            )?;
+            validate_operation(Some(&dataset.manifest), &attempt_transaction.operation)?;
+
+            // Recomputed every attempt: the rebase above may have rewritten the
+            // transaction.
+            let pb_transaction = pb::Transaction::try_from(attempt_transaction.as_ref())?;
+            let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
+            // Classified from the operation itself. Reading it back off the inline
+            // copy would tie the verdict to the payload size instead.
+            let may_change_schema = operation_may_change_schema(&pb_transaction);
+
+            current_transaction_file = if !write_config.disable_transaction_file() {
+                write_transaction_file(object_store, &dataset.base, &pb_transaction).await?
+            } else {
+                String::new()
+            };
+            let transaction_file = current_transaction_file.as_str();
+
+            target_version = dataset.manifest.version + 1;
+            if is_detached_version(target_version) {
+                return Err(Error::internal(
+                    "more than 2^65 versions have been created and so regular version numbers are appearing as 'detached' versions.",
+                ));
+            }
+            // Build an up-to-date manifest from the transaction and current
+            // manifest: prepare the index list against this attempt's manifest
+            // first, then build from the prepared result.
+            let build_config =
+                build_config_for_attempt(&dataset, &attempt_transaction, write_config).await?;
+            let (mut manifest, mut indices) = match attempt_transaction.operation {
+                Operation::Restore { version } => {
+                    // A restore reinstates its snapshot's index list and entry
+                    // whole; nothing is prepared or withdrawn a second time.
+                    Transaction::restore_old_manifest(
                         object_store,
+                        commit_handler,
                         &dataset.base,
-                        &current_transaction_file,
+                        version,
+                        &build_config,
+                        transaction_file,
+                        &dataset.manifest,
+                    )
+                    .await?
+                }
+                _ => {
+                    let frag_reuse = match tagged_rewrite.take() {
+                        Some(assembly) => FragReuseUpdate::Rewrite(assembly),
+                        None if write_config.tagged_frag_reuse_trim() => FragReuseUpdate::Trim,
+                        None => FragReuseUpdate::None,
+                    };
+                    let prepared =
+                        prepare_attempt(&dataset, &attempt_transaction, &build_config, frag_reuse)
+                            .await?;
+                    let (mut manifest, indices) = attempt_transaction.build_manifest_prepared(
+                        Some(dataset.manifest.as_ref()),
+                        prepared,
+                        transaction_file,
+                        &build_config,
+                        read_version_state,
+                    )?;
+                    crate::dataset::write::seeds::apply_seed_feature_flags(
+                        &mut manifest,
+                        &indices,
+                        &dataset,
+                    )
+                    .await?;
+                    (manifest, indices)
+                }
+            };
+
+            manifest.version = target_version;
+
+            let previous_writer_version = &dataset.manifest.writer_version;
+            // The versions of Lance prior to when we started writing the writer version
+            // sometimes wrote incorrect `Fragment.physical_rows` values, so we should
+            // make sure to recompute them.
+            // See: https://github.com/lance-format/lance/issues/1531
+            let recompute_stats = previous_writer_version.is_none();
+
+            migrate_manifest(&dataset, &mut manifest, recompute_stats).await?;
+
+            fix_schema(&mut manifest)?;
+            validate_non_reusable_field_id_transition(
+                &dataset.manifest,
+                &manifest,
+                &attempt_transaction.operation,
+            )?;
+
+            crate::dataset::versions::check_manifest_storage_version_for_commit(&mut manifest)?;
+            check_fragment_ids(&manifest)?;
+
+            // Runs after the coverage derivation and can replace a fragment bitmap
+            // while keeping its UUID, so anything it narrowed loses its position.
+            let recovered_coverage = migrate_indices(&dataset, &mut indices).await?;
+            Transaction::withdraw_coverage_invalidated_after_build(
+                &mut indices,
+                &recovered_coverage,
+                target_version,
+            )?;
+
+            // Try to commit the manifest
+            let result = write_manifest_file(
+                object_store,
+                commit_handler,
+                &dataset.base,
+                &mut manifest,
+                if indices.is_empty() {
+                    None
+                } else {
+                    Some(indices.clone())
+                },
+                write_config,
+                manifest_naming_scheme,
+                inline_transaction.then(|| pb_transaction.into()),
+                may_change_schema,
+            )
+            .await;
+
+            match result {
+                Ok(manifest_location) => {
+                    record_successful_commit(
+                        &dataset,
+                        &attempt_transaction,
+                        &manifest,
+                        &manifest_location,
+                        indices,
+                        commit_config.skip_auto_cleanup,
                     )
                     .await;
-                    if retry_start.elapsed() > retry_timeout {
-                        return Err(timeout_error(retry_timeout, backoff.attempt() + 1));
-                    }
-                    let sleep_fut = tokio::time::sleep(backoff.next_backoff());
-                    maybe_timeout(backoff.attempt(), retry_start, retry_timeout, sleep_fut).await?;
-                    continue;
-                } else {
-                    break;
+                    return Ok((manifest, manifest_location));
                 }
-            }
-            Err(CommitError::OtherError(err)) => {
-                match verify_commit_outcome(
-                    object_store,
-                    commit_handler,
-                    &dataset.base,
-                    target_version,
-                    &attempt_transaction,
-                )
-                .await
-                {
-                    CommitOutcome::Ours {
-                        manifest: committed_manifest,
-                        location,
-                    } => {
-                        let committed_manifest = *committed_manifest;
-                        record_successful_commit(
-                            &dataset,
-                            &attempt_transaction,
-                            &committed_manifest,
-                            &location,
-                            indices,
-                            commit_config.skip_auto_cleanup,
-                        )
-                        .await;
-                        if commit_handler.propagate_commit_error_after_success() {
-                            return Err(err);
+                Err(CommitError::CommitConflict) => {
+                    // The store may have applied this attempt's write and still
+                    // reported a conflict (e.g. the response to a successful
+                    // conditional PUT was lost and an internal retry saw
+                    // "already exists"). Verify who owns the version before
+                    // treating the attempt as lost: deleting the artifacts of a
+                    // commit that actually landed corrupts the version.
+                    match verify_commit_outcome(
+                        object_store,
+                        commit_handler,
+                        &dataset.base,
+                        target_version,
+                        &attempt_transaction,
+                    )
+                    .await
+                    {
+                        CommitOutcome::Ours {
+                            manifest: committed_manifest,
+                            location,
+                        } => {
+                            let committed_manifest = *committed_manifest;
+                            record_successful_commit(
+                                &dataset,
+                                &attempt_transaction,
+                                &committed_manifest,
+                                &location,
+                                indices,
+                                commit_config.skip_auto_cleanup,
+                            )
+                            .await;
+                            return Ok((committed_manifest, location));
                         }
-                        return Ok((committed_manifest, location));
+                        // Confirmed loss: another writer owns the version (or,
+                        // for handlers that detect conflicts before writing,
+                        // the attempt never landed). Proceed with the normal
+                        // rebase-and-retry path.
+                        CommitOutcome::Foreign | CommitOutcome::Absent => {}
+                        CommitOutcome::Unknown => {
+                            return Err(Error::commit_status_unknown_source(
+                                target_version,
+                                "commit reported a conflict but the manifest at the target \
+                                 version could not be read back for verification"
+                                    .to_string()
+                                    .into(),
+                            ));
+                        }
                     }
-                    CommitOutcome::Foreign | CommitOutcome::Absent => {
-                        // The attempt certainly did not land; its
-                        // transaction file is orphaned.
+                    let next_attempt_i = backoff.attempt() + 1;
+
+                    if backoff.attempt() == 0 {
+                        // We add 10% buffer here, to allow concurrent writes to complete.
+                        // We pass the first attempt's time to the backoff so it's used
+                        // as the unit for backoff time slots. The catch-up before the
+                        // attempt is excluded: it is not the window in which concurrent
+                        // writers collide with this one.
+                        // See SlotBackoff implementation for more details on how this works.
+                        backoff =
+                            backoff.with_unit((attempt_start.elapsed().as_millis() * 11 / 10) as u32);
+                    }
+
+                    if next_attempt_i < num_attempts {
+                        // The transaction file from this attempt is now stale; clean it up
+                        // before the next attempt writes a new one (possibly rebased).
                         cleanup_transaction_file(
                             object_store,
                             &dataset.base,
                             &current_transaction_file,
                         )
                         .await;
-                        return Err(err);
+                        if retry_start.elapsed() > retry_timeout {
+                            return Err(timeout_error(retry_timeout, backoff.attempt() + 1));
+                        }
+                        let sleep_fut = tokio::time::sleep(backoff.next_backoff());
+                        maybe_timeout(backoff.attempt(), retry_start, retry_timeout, sleep_fut).await?;
+                        continue;
+                    } else {
+                        break;
                     }
-                    CommitOutcome::Unknown => {
-                        return Err(Error::commit_status_unknown_source(
-                            target_version,
-                            Box::new(err),
-                        ));
+                }
+                Err(CommitError::OtherError(err)) => {
+                    match verify_commit_outcome(
+                        object_store,
+                        commit_handler,
+                        &dataset.base,
+                        target_version,
+                        &attempt_transaction,
+                    )
+                    .await
+                    {
+                        CommitOutcome::Ours {
+                            manifest: committed_manifest,
+                            location,
+                        } => {
+                            let committed_manifest = *committed_manifest;
+                            record_successful_commit(
+                                &dataset,
+                                &attempt_transaction,
+                                &committed_manifest,
+                                &location,
+                                indices,
+                                commit_config.skip_auto_cleanup,
+                            )
+                            .await;
+                            if commit_handler.propagate_commit_error_after_success() {
+                                return Err(err);
+                            }
+                            return Ok((committed_manifest, location));
+                        }
+                        CommitOutcome::Foreign | CommitOutcome::Absent => {
+                            // The attempt certainly did not land; its
+                            // transaction file is orphaned.
+                            cleanup_transaction_file(
+                                object_store,
+                                &dataset.base,
+                                &current_transaction_file,
+                            )
+                            .await;
+                            return Err(err);
+                        }
+                        CommitOutcome::Unknown => {
+                            return Err(Error::commit_status_unknown_source(
+                                target_version,
+                                Box::new(err),
+                            ));
+                        }
                     }
                 }
             }
         }
-    }
 
-    cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file).await;
-    Err(crate::Error::commit_conflict_source(
-        target_version,
-        format!(
-            "Failed to commit the transaction after {} retries.",
-            commit_config.num_retries
-        )
-        .into(),
-    ))
+        cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file).await;
+        Err(crate::Error::commit_conflict_source(
+            target_version,
+            format!(
+                "Failed to commit the transaction after {} retries.",
+                commit_config.num_retries
+            )
+            .into(),
+        ))
+    })
+    .await
 }
 
 #[cfg(test)]

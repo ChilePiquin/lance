@@ -810,7 +810,7 @@ impl FromJObjectWithEnv<Uuid> for JObject<'_> {
             .l()?;
         let uuid_string = JString::from(uuid_string);
         let uuid_string: String = env.get_string(&uuid_string)?.into();
-        let uuid = Uuid::parse_str(uuid_string.to_string().as_str()).map_err(|e| {
+        let uuid = Uuid::parse_str(&uuid_string).map_err(|e| {
             Error::input_error(format!(
                 "Invalid UUID string: {}, error: {}",
                 uuid_string, e
@@ -845,7 +845,7 @@ fn inner_read_transaction<'local>(
     Ok(transaction)
 }
 
-pub(crate) fn convert_to_java_transaction<'local>(
+pub fn convert_to_java_transaction<'local>(
     env: &mut JNIEnv<'local>,
     transaction: Transaction,
 ) -> Result<JObject<'local>> {
@@ -877,7 +877,7 @@ pub(crate) fn convert_to_java_transaction<'local>(
     Ok(java_transaction)
 }
 
-pub(crate) fn convert_to_java_operation<'local>(
+pub fn convert_to_java_operation<'local>(
     env: &mut JNIEnv<'local>,
     operation: Option<Operation>,
 ) -> Result<JObject<'local>> {
@@ -1231,13 +1231,16 @@ fn convert_to_java_operation_inner<'local>(
                 &[JValue::Object(&new_bases)],
             )?)
         }
+        Operation::Pin(_) => Err(Error::unsupported_error(
+            "Ongoing-work pin operations are not exposed by the Java transaction API".to_string(),
+        )),
         Operation::Unknown { .. } => Err(Error::input_error(
             "Cannot convert an operation written by a newer version of Lance".to_string(),
         )),
     }
 }
 
-pub(crate) fn convert_to_java_schema<'local>(
+pub fn convert_to_java_schema<'local>(
     env: &mut JNIEnv<'local>,
     schema: LanceSchema,
 ) -> Result<JObject<'local>> {
