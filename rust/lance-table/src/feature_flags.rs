@@ -315,8 +315,8 @@ pub fn inherit_sticky_feature_flags(destination: &mut Manifest, source: &Manifes
     let sticky_flags = validated_sticky_paired_flags(source)?;
     validate_non_reusable_field_id_flags(source)?;
     destination.reader_feature_flags |= sticky_flags;
-    destination.writer_feature_flags |=
-        sticky_flags | (source.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS);
+    source.validate_ongoing_work_pins()?;
+    destination.writer_feature_flags |= source.writer_feature_flags & STICKY_WRITER_FLAGS;
     Ok(())
 }
 
