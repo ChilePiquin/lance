@@ -1810,7 +1810,7 @@ pub(crate) async fn commit_transaction(
         // for users. So we always check for other transactions.
         // We skip this for strict overwrites, because strict overwrites can't be rebased.
         if let Operation::Pin(operation) = &transaction.operation {
-            dataset = dataset.current_for_ongoing_work().await?;
+            dataset = Box::pin(dataset.current_for_ongoing_work()).await?;
             ensure_can_write_manifest(&dataset.manifest)?;
             if let lance_table::transaction::PinOperation::Register {
                 source_transaction_uuid,
@@ -1902,7 +1902,7 @@ pub(crate) async fn commit_transaction(
             & lance_table::feature_flags::FLAG_ONGOING_WORK_PINS
             != 0
         {
-            let current = dataset.current_for_ongoing_work().await?;
+            let current = Box::pin(dataset.current_for_ongoing_work()).await?;
             if current.manifest.version != dataset.manifest.version
                 || current.ongoing_work_source_id().await?
                     != dataset.ongoing_work_source_id().await?
