@@ -1816,20 +1816,18 @@ pub(crate) async fn commit_transaction(
                 source_transaction_uuid,
                 ..
             } = operation
-            {
-                if !dataset
+                && !dataset
                     .manifest
                     .ongoing_work_pins
                     .iter()
                     .any(|p| p.id == transaction.uuid)
-                    && (dataset.manifest.version != transaction.read_version
-                        || dataset.ongoing_work_source_id().await? != *source_transaction_uuid)
-                {
-                    return Err(Error::commit_conflict_source(
-                        dataset.manifest.version,
-                        "pin registration source is no longer current".into(),
-                    ));
-                }
+                && (dataset.manifest.version != transaction.read_version
+                    || dataset.ongoing_work_source_id().await? != *source_transaction_uuid)
+            {
+                return Err(Error::commit_conflict_source(
+                    dataset.manifest.version,
+                    "pin registration source is no longer current".into(),
+                ));
             }
             let mut state = dataset.manifest.as_ref().clone();
             if !operation.apply(&transaction, &mut state)? {

@@ -433,6 +433,7 @@ pub fn ensure_can_read_manifest(manifest: &Manifest) -> Result<()> {
 /// Refuse writes to manifests whose required writer features this build does
 /// not support or whose paired capabilities are inconsistent.
 pub fn ensure_can_write_manifest(manifest: &Manifest) -> Result<()> {
+    manifest.validate_ongoing_work_pins()?;
     validate_paired_feature_flags(manifest)?;
     validate_non_reusable_field_id_flags(manifest)?;
     if !can_write_dataset(manifest.writer_feature_flags) {

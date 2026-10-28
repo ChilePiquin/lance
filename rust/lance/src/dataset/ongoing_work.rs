@@ -227,10 +227,13 @@ mod tests {
     use super::*;
     use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
-    use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+    use crate::index::DatasetIndexExt;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::types::Int32Type;
-    use lance_index::{IndexType, scalar::ScalarIndexParams};
+    use lance_index::{
+        IndexType,
+        scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
+    };
 
     fn time(seconds: i64) -> PinTime {
         PinTime { seconds, nanos: 0 }
@@ -288,6 +291,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ongoing_work_restore_preserves_current_membership() {
+        let mut source = dataset().await;
+        let request = source
+            .prepare_ongoing_work_pin(time(1), time(10), None)
+            .await
+            .unwrap();
+        let pin = source.register_ongoing_work_pin(request).await.unwrap();
+        source.restore().await.unwrap();
+        let current = source.current_for_ongoing_work().await.unwrap();
+        assert_eq!(current.manifest.ongoing_work_pins, vec![pin.clone()]);
+        current.manifest.validate_ongoing_work_pins().unwrap();
+        let mut pinned_snapshot = current.clone();
+        current.release_ongoing_work_pin(&pin.id).await.unwrap();
+        pinned_snapshot.restore().await.unwrap();
+        let restored = source.current_for_ongoing_work().await.unwrap();
+        assert!(restored.manifest.ongoing_work_pins.is_empty());
+        assert_ne!(
+            restored.manifest.writer_feature_flags
+                & lance_table::feature_flags::FLAG_ONGOING_WORK_PINS,
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn ongoing_work_registration_cannot_rebase_to_another_source() {
         let ds = dataset().await;
         let request = ds
@@ -308,8 +335,28 @@ mod tests {
     #[case::no_committed_index(false)]
     #[case::disjoint_committed_index(true)]
     #[tokio::test]
-    async fn ongoing_work_compaction_cleanup_publish(#[case] old_index: bool) {
+    async fn ongoing_work_compaction_cleanup_publish(
+        #[case] old_index: bool,
+        #[values(false, true)] tagged: bool,
+    ) {
         let mut ds = dataset().await;
+        if tagged {
+            let manifest = Arc::make_mut(&mut ds.manifest);
+            manifest.reader_feature_flags |= lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+            manifest.writer_feature_flags |= lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+            crate::index::frag_reuse_reader::tests::persist_fixture(&mut ds, vec![]).await;
+            ds.apply_commit(
+                Transaction::new(
+                    ds.version_id(),
+                    Operation::ReserveFragments { num_fragments: 0 },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        }
         let params = ScalarIndexParams::default();
         if old_index {
             // Keep an old index whose bitmap is disjoint from the rewrite below.
@@ -340,7 +387,7 @@ mod tests {
         compact_files(
             &mut current,
             CompactionOptions {
-                target_rows_per_fragment: 100,
+                target_rows_per_fragment: 8,
                 defer_index_remap: true,
                 excluded_fragment_ids: if old_index { vec![0] } else { vec![] },
                 ..Default::default()
@@ -349,13 +396,24 @@ mod tests {
         )
         .await
         .unwrap();
+        compact_files(
+            &mut current,
+            CompactionOptions {
+                target_rows_per_fragment: 100,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
         let before = current.version_id();
         assert!(
-            current
-                .open_frag_reuse_index(&lance_index::metrics::NoOpMetricsCollector)
+            crate::index::load_all_indices(&current)
                 .await
                 .unwrap()
-                .is_some()
+                .iter()
+                .any(|index| index.name == lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME)
         );
         cleanup_frag_reuse_index(&mut current).await.unwrap();
         assert_eq!(current.version_id(), before);
@@ -394,5 +452,152 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("no longer active"));
+    }
+    #[tokio::test]
+    async fn ongoing_work_fts_rebuild_survives_cleanup() {
+        let mut ds = lance_datagen::gen_batch()
+            .col(
+                "text",
+                lance_datagen::array::cycle_utf8_literals(&["alpha", "beta"]),
+            )
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(4))
+            .await
+            .unwrap();
+        let params = InvertedIndexParams::default();
+        let old = ds
+            .create_index_builder(&["text"], IndexType::Inverted, &params)
+            .name("text_idx".into())
+            .fragments(vec![0])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        ds.commit_existing_index_segments("text_idx", "text", vec![old])
+            .await
+            .unwrap();
+        let request = ds
+            .prepare_ongoing_work_pin(time(1), time(253402300000), None)
+            .await
+            .unwrap();
+        let pin = ds.register_ongoing_work_pin(request).await.unwrap();
+        let staged = ds
+            .create_index_builder(&["text"], IndexType::Inverted, &params)
+            .name("text_idx".into())
+            .replace(true)
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let mut current = ds.current_for_ongoing_work().await.unwrap();
+        compact_files(
+            &mut current,
+            CompactionOptions {
+                target_rows_per_fragment: 100,
+                defer_index_remap: true,
+                excluded_fragment_ids: vec![0],
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        cleanup_frag_reuse_index(&mut current).await.unwrap();
+        ds.commit_existing_index_segments_with_pin("text_idx", "text", vec![staged], &pin.id)
+            .await
+            .unwrap();
+        ds.release_ongoing_work_pin(&pin.id).await.unwrap();
+        let hits = ds
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("alpha".into()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(hits.num_rows(), 8);
+    }
+    #[tokio::test]
+    async fn ongoing_work_rejects_rewrite_planned_without_recording() {
+        let ds = dataset().await;
+        let old = ds.fragments()[0].clone();
+        let mut new = old.clone();
+        new.id = 4;
+        let rewrite = Transaction::new(
+            ds.version_id(),
+            Operation::Rewrite {
+                groups: vec![lance_table::transaction::RewriteGroup {
+                    old_fragments: vec![old],
+                    new_fragments: vec![new],
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index: None,
+            },
+            None,
+        );
+        let request = ds
+            .prepare_ongoing_work_pin(time(1), time(253402300000), None)
+            .await
+            .unwrap();
+        ds.register_ongoing_work_pin(request).await.unwrap();
+        let error = CommitBuilder::new(Arc::new(ds))
+            .execute(rewrite)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::RetryableCommitConflict { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("requires fragment reuse recording")
+        );
+    }
+
+    #[tokio::test]
+    async fn ongoing_work_rejects_trim_planned_before_registration() {
+        let ds = dataset().await;
+        let request = ds
+            .prepare_ongoing_work_pin(time(1), time(253402300000), None)
+            .await
+            .unwrap();
+        let pin = ds.register_ongoing_work_pin(request).await.unwrap();
+        let mut current = ds.current_for_ongoing_work().await.unwrap();
+        compact_files(
+            &mut current,
+            CompactionOptions {
+                target_rows_per_fragment: 100,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        current.release_ongoing_work_pin(&pin.id).await.unwrap();
+        let current = current.current_for_ongoing_work().await.unwrap();
+        let indices = crate::index::load_all_indices(&current).await.unwrap();
+        let fri = indices
+            .iter()
+            .find(|i| i.name == lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME)
+            .unwrap()
+            .clone();
+        let trim = Transaction::new(
+            current.version_id(),
+            Operation::CreateIndex {
+                new_indices: vec![],
+                removed_indices: vec![fri],
+            },
+            None,
+        );
+        let request = current
+            .prepare_ongoing_work_pin(time(1), time(253402300000), None)
+            .await
+            .unwrap();
+        current.register_ongoing_work_pin(request).await.unwrap();
+        let error = CommitBuilder::new(Arc::new(current))
+            .execute(trim)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::RetryableCommitConflict { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("prevents fragment reuse history replacement")
+        );
     }
 }

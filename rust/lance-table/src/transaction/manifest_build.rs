@@ -846,12 +846,11 @@ impl Transaction {
                 .transaction_properties
                 .as_ref()
                 .and_then(|p| p.get("lance.ongoing_work_pin"))
+                && !current.ongoing_work_pins.iter().any(|p| &p.id == id)
             {
-                if !current.ongoing_work_pins.iter().any(|p| &p.id == id) {
-                    return Err(Error::invalid_input(format!(
-                        "ongoing-work pin {id} is no longer active; rebuild before publishing"
-                    )));
-                }
+                return Err(Error::invalid_input(format!(
+                    "ongoing-work pin {id} is no longer active; rebuild before publishing"
+                )));
             }
             if !current.ongoing_work_pins.is_empty() {
                 if config.migration_next_row_id.is_some() {
